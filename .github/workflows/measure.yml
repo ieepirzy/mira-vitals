@@ -1,0 +1,143 @@
+name: Code health (reusable)
+
+# Callable from any repository:
+#
+#   jobs:
+#     code-health:
+#       uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@main
+#       with:
+#         gate: true
+#       secrets: inherit
+#
+# A reusable workflow shares the caller's workflow run, so it can download an
+# artifact the caller's own test job published in that same run. That is what
+# lets the snapshot describe the execution which actually gated the build
+# rather than a second one this job started for itself.
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Interpreter used to run the analyzers."
+        type: string
+        default: "3.12"
+      config-paths:
+        description: "Extra pip install target, e.g. '-e .[dev]', so the type checker resolves the project's imports."
+        type: string
+        default: ""
+      reports-artifact:
+        description: "Artifact holding junit.xml and coverage.xml from the gating test job. Omitted means tests are recorded as skipped."
+        type: string
+        default: ""
+      tests-python-version:
+        description: "Interpreter that produced those reports. Recorded, because coverage differs between interpreters."
+        type: string
+        default: ""
+      gate:
+        description: "Apply blocking quality gates."
+        type: boolean
+        default: false
+      default-branch:
+        type: string
+        default: "main"
+      mira-vitals-version:
+        description: "Pin the collector. Upgrading is a deliberate act; it shows in the series as a step change."
+        type: string
+        default: "mira-vitals"
+    secrets:
+      OTEL_EXPORTER_OTLP_HEADERS:
+        required: false
+      CODE_HEALTH_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: Analyze and export
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The merge base against the default branch is needed to describe a
+          # pull request's change; a shallow clone does not contain it.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install the collector and its analyzers
+        run: |
+          pip install "${{ inputs.mira-vitals-version }}[analyzers,otel]"
+          # The project's own dependencies, so the type checker resolves its
+          # imports. Without them the error count is dominated by
+          # reportMissingImports and is not comparable with a run that has them.
+          if [ -n "${{ inputs.config-paths }}" ]; then
+            pip install ${{ inputs.config-paths }}
+          fi
+
+      - name: Fetch the reports the gating test run produced
+        if: inputs.reports-artifact != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.reports-artifact }}
+          path: reports
+
+      - name: Fetch the previous default-branch snapshot as a baseline
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          run_id="$(gh run list --branch '${{ inputs.default-branch }}' --status success \
+            --limit 1 --json databaseId --jq '.[0].databaseId' || true)"
+          if [ -z "${run_id:-}" ] || [ "${run_id}" = "null" ]; then
+            echo "no previous successful default-branch run; deltas will be unavailable"
+            exit 0
+          fi
+          mkdir -p baseline
+          gh run download "$run_id" --name code-health-main --dir baseline \
+            || echo "baseline artifact unavailable for run $run_id"
+
+      - name: Analyze, report and export
+        env:
+          # Standard OpenTelemetry configuration only. The Collector decides
+          # where anything goes; CI does not know the backends.
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+          OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+          CODE_HEALTH_ENDPOINT: ${{ vars.CODE_HEALTH_ENDPOINT }}
+          CODE_HEALTH_TOKEN: ${{ secrets.CODE_HEALTH_TOKEN }}
+          MIRA_VITALS_DEFAULT_BRANCH: ${{ inputs.default-branch }}
+          CODE_HEALTH_DEFAULT_BRANCH: ${{ inputs.default-branch }}
+          # Provenance: explicit metadata only. Labels are trusted because
+          # applying one requires write access.
+          MIRA_VITALS_PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          GITHUB_EVENT_PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          args=(--output code-health.json --emit-otlp --emit-http)
+          [ -f reports/junit.xml ]    && args+=(--junit reports/junit.xml)
+          [ -f reports/coverage.xml ] && args+=(--coverage reports/coverage.xml)
+          [ -n "${{ inputs.tests-python-version }}" ] && \
+            args+=(--tests-python-version "${{ inputs.tests-python-version }}")
+          [ -f baseline/code-health.json ] && args+=(--baseline baseline/code-health.json)
+          [ "${{ inputs.gate }}" = "true" ] && args+=(--gate)
+          mira-vitals "${args[@]}"
+
+      # Always uploaded, including when the gate failed: the measurement of a
+      # failing commit is exactly as valuable as that of a passing one.
+      - name: Upload the canonical artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-health-${{ github.ref_name == inputs.default-branch && 'main' || format('pr-{0}', github.run_id) }}
+          path: code-health.json
+          retention-days: 90

@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: pip install -e ".[dev,analyzers,otel,mypy]"
+      - name: Run tests
+        run: |
+          pytest -q --tb=short --junitxml=reports/junit.xml
+      - name: Publish the reports the code-health lane consumes
+        if: always() && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-py312
+          path: reports/
+          retention-days: 7
+
+  # This package measures itself. Dogfooding is not a gimmick: a metric
+  # definition nobody applies to their own code is one nobody has checked, and
+  # a collector that cannot pass its own gate has no business gating anyone's.
+  code-health:
+    name: Code health (self)
+    needs: [test]
+    if: always()
+    uses: ./.github/workflows/measure.yml
+    with:
+      config-paths: "-e .[dev]"
+      reports-artifact: test-reports-py312
+      tests-python-version: "3.12"
+      gate: true
+    secrets: inherit

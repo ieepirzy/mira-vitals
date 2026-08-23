@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mira-vitals"
+version = "0.1.0"
+description = "Code health, maintainability and provenance telemetry for CI, with OTLP export and a versioned canonical snapshot"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "ieepirzy" }]
+keywords = ["code-quality", "complexity", "opentelemetry", "otlp", "ci", "telemetry", "provenance"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: System :: Monitoring",
+]
+
+# The core is deliberately dependency-free. It shells out to the analyzers and
+# reads their machine-readable output, so a CI helper whose job is to report
+# that something is broken cannot itself be broken by a dependency resolution.
+dependencies = []
+
+[project.optional-dependencies]
+# The analyzers, pinned exactly rather than floated. An unpinned `ruff>=0.5`
+# measured 12 findings under 0.15.8 and 153 under 0.16.4 on one unchanged
+# commit, because 0.16 widened its default rule selection -- and dropped E402
+# from it, so the count of *blocking* findings moved too. The collector passes
+# --select explicitly, which fixes the rule set independently of the version;
+# pinning closes the remaining drift, since a rule's implementation can change
+# between releases. Upgrading is a deliberate act and shows up in the series as
+# a step change with the new version recorded beside it.
+analyzers = ["radon==6.0.1", "ruff==0.16.4", "pyright==1.1.408"]
+mypy = ["mypy==1.19.1"]
+
+# OTLP export. Optional on purpose: without these the collector still produces
+# the canonical artifact and prints the summary, and records the export as
+# skipped rather than failing. Pinned for a weaker reason than the analyzers --
+# the SDK version changes no recorded value, so it is not a comparability
+# hazard, but `LogRecord` moved out of `opentelemetry.sdk._logs` between
+# releases and a float across that boundary silently disables the event stream
+# while the job stays green.
+otel = [
+  "opentelemetry-sdk==1.44.0",
+  "opentelemetry-exporter-otlp-proto-http==1.44.0",
+]
+
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+mira-vitals = "mira_vitals.cli:run"
+
+[project.urls]
+Homepage = "https://github.com/ieepirzy/mira-vitals"
+Source = "https://github.com/ieepirzy/mira-vitals"
+Issues = "https://github.com/ieepirzy/mira-vitals/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mira_vitals"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+# This package measures itself. Dogfooding is not a gimmick here: the collector
+# is only trustworthy if its own numbers are, and a metric definition nobody
+# applies to themselves is one nobody has checked.
+[tool.mira_vitals]
+paths = ["src/mira_vitals"]
+lint_paths = ["src/mira_vitals", "tests"]
+lint_gate_paths = ["src/mira_vitals", "tests"]
+lint_select = ["E4", "E7", "E9", "F", "W"]
+lint_blocking = true
+typecheck_paths = ["src/mira_vitals"]
+type_checker = "pyright"
+typecheck_blocking = false
+hotspot_limit = 20
+
+# The schema half of the schema/values split: which labels and which
+# environment variables carry provenance here. Values arrive at run time.
+[tool.mira_vitals.provenance.labels]
+"authoring:human" = "human"
+"authoring:human-assisted" = "human_assisted"
+"authoring:agent-supervised" = "agent_supervised"
+"authoring:agent-autonomous" = "agent_autonomous"
+"authoring:mixed" = "mixed"
