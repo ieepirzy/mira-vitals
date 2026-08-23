@@ -23,9 +23,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install
         run: pip install -e ".[dev,analyzers,otel,mypy]"
+      # Coverage is measured on every leg so the command stays identical across
+      # the matrix; only 3.12's reports are published, because the snapshot
+      # needs one deterministic source. Without --cov this package reported its
+      # own coverage as n/a, which is honest but leaves the dogfooding
+      # incomplete -- a collector that does not measure its own test coverage
+      # is not fully eating what it serves.
       - name: Run tests
         run: |
-          pytest -q --tb=short --junitxml=reports/junit.xml
+          pytest -q --tb=short \
+            --junitxml=reports/junit.xml \
+            --cov=mira_vitals --cov-report=xml:reports/coverage.xml
       - name: Publish the reports the code-health lane consumes
         if: always() && matrix.python-version == '3.12'
         uses: actions/upload-artifact@v4
