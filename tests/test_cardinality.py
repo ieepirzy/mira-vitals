@@ -102,3 +102,44 @@ def test_metric_names_match_the_registry(snapshot_factory):
 def test_every_metric_point_carries_the_bounded_attribute_set(snapshot_factory):
     for point in otel.build_metric_points(snapshot_factory()):
         metrics.assert_bounded_attributes(point["attributes"])
+
+
+def test_a_degraded_section_exports_no_metrics(snapshot_factory):
+    """A partial measurement must never reach the metric stream.
+
+    The radon adapters keep the files they parsed while marking the tool
+    `error`, so a partial LOC total is a real number over an incomplete input.
+    Exported as an ordinary point it is indistinguishable from a complete
+    measurement forever, and the run's exit code cannot help: telemetry is sent
+    before the failure is acted on, and a metric point carries no status.
+    """
+    document = snapshot_factory()
+    document["summary"]["status"] = "error"
+    names = {point["name"] for point in otel.build_metric_points(document)}
+    assert "code.health.loc" not in names
+    assert "code.health.source_loc" not in names
+    assert "code.health.files" not in names
+    # Sections that were fine still report.
+    assert "code.health.complexity.total" in names
+    assert "code.health.lint.issues" in names
+
+
+def test_each_section_suppresses_only_its_own_metrics(snapshot_factory):
+    for section, suppressed, kept in (
+        ("complexity", "code.health.complexity.total", "code.health.lint.issues"),
+        ("lint", "code.health.lint.issues", "code.health.complexity.total"),
+        ("typing", "code.health.type.errors", "code.health.lint.issues"),
+        ("tests", "code.health.coverage", "code.health.complexity.total"),
+        ("maintainability", "code.health.maintainability.index", "code.health.lint.issues"),
+    ):
+        document = snapshot_factory()
+        document[section]["status"] = "error"
+        names = {point["name"] for point in otel.build_metric_points(document)}
+        assert suppressed not in names, f"{section} error must suppress {suppressed}"
+        assert kept in names, f"{section} error must not suppress {kept}"
+
+
+def test_every_metric_declares_which_status_governs_it():
+    """A metric with no governing status would slip through the suppression."""
+    for spec in metrics.METRICS:
+        assert "status" in spec, f"{spec['name']} declares no governing status"

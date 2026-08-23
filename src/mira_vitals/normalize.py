@@ -204,6 +204,7 @@ def build(
     security: dict[str, Any],
     tools: dict[str, Any],
     complexity_status: str,
+    summary_status: str = "ok",
     maintainability_status: str,
     halstead_status: str,
     deltas: dict[str, Any] | None = None,
@@ -225,6 +226,11 @@ def build(
         "target": target,
         "provenance": provenance,
         "summary": {
+            # Governs the LOC and file counts: they come from radon's raw pass,
+            # which can parse some files and fail on others. Without this the
+            # metric exporter has no way to tell a partial total from a whole
+            # one, and a metric point carries no status downstream.
+            "status": summary_status,
             "loc": loc,
             "source_loc": source_loc,
             "files": len(raw) or None,

@@ -141,3 +141,24 @@ def test_observation_id_still_dedupes_identical_analyses():
         analyzed_tree_sha="merge_aaa",
     )
     assert schema.observation_id(**args) == schema.observation_id(**args)
+
+
+def test_repository_identity_keeps_its_owner():
+    """Two organisations can both have a repository called `backend`.
+
+    Reduced to a basename they share a `service.name`, merging their metric
+    series -- and a fork at the same commit and tree produces the same
+    `observation_id`, so a receiver deduplicating on it discards one
+    repository's measurement as a replay of the other's.
+    """
+    from mira_vitals import context
+
+    run_a, _ = context.collect({"GITHUB_REPOSITORY": "org-a/backend"}, repo_root=".")
+    run_b, _ = context.collect({"GITHUB_REPOSITORY": "org-b/backend"}, repo_root=".")
+    assert run_a["repository"] == "org-a/backend"
+    assert run_b["repository"] == "org-b/backend"
+
+    same = dict(commit_sha="c" * 40, target_paths=["src"], analyzed_tree_sha="t" * 40)
+    assert schema.observation_id(repository=run_a["repository"], **same) != schema.observation_id(
+        repository=run_b["repository"], **same
+    )

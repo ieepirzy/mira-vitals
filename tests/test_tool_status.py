@@ -251,3 +251,104 @@ def test_one_report_missing_and_one_present_keeps_what_was_read(tmp_path):
     assert data["passed"] == 5
     assert data["coverage_percent"] is None
     assert "not produced" in data["error"]
+
+
+def test_a_pyright_config_error_is_not_a_clean_bill_of_health(monkeypatch):
+    """Verified against the real tool: a malformed pyrightconfig.json exits 3,
+    writes the parse error to stderr, and still emits a well-formed JSON
+    summary with errorCount 0. Trusting the payload records zero type errors
+    for a checker that never ran."""
+    from mira_vitals.analyzers import typecheck
+
+    monkeypatch.setattr(typecheck, "tool_version", lambda command: "pyright 1.1.408")
+    monkeypatch.setattr(
+        typecheck,
+        "run",
+        lambda command, cwd=None: base.Completed(
+            returncode=3,
+            stdout='{"summary": {"filesAnalyzed": 1, "errorCount": 0, "warningCount": 0}}',
+            stderr='Config file "pyrightconfig.json" could not be parsed.',
+            duration=0.5,
+        ),
+    )
+    data, tool = typecheck.collect(["pkg"], tool_name="pyright")
+    assert tool.status == "error"
+    assert data["errors"] is None, "a broken checker must not report zero errors"
+    assert "exited 3" in tool.error
+
+
+def test_pyright_exit_one_is_findings_not_failure(monkeypatch):
+    from mira_vitals.analyzers import typecheck
+
+    monkeypatch.setattr(typecheck, "tool_version", lambda command: "pyright 1.1.408")
+    monkeypatch.setattr(
+        typecheck,
+        "run",
+        lambda command, cwd=None: base.Completed(
+            returncode=1,
+            stdout='{"summary": {"filesAnalyzed": 1, "errorCount": 3, "warningCount": 0},'
+            ' "generalDiagnostics": []}',
+            stderr="",
+            duration=0.5,
+        ),
+    )
+    data, tool = typecheck.collect(["pkg"], tool_name="pyright")
+    assert tool.status == "ok"
+    assert data["errors"] == 3
+
+
+def test_import_diagnostics_are_counted_only_at_error_severity(monkeypatch):
+    """`errors` is pyright's error-only total, so subtracting an all-severity
+    import count from it can go negative."""
+    from mira_vitals.analyzers import typecheck
+
+    monkeypatch.setattr(typecheck, "tool_version", lambda command: "pyright 1.1.408")
+    monkeypatch.setattr(
+        typecheck,
+        "run",
+        lambda command, cwd=None: base.Completed(
+            returncode=1,
+            stdout=(
+                '{"summary": {"filesAnalyzed": 1, "errorCount": 0, "warningCount": 1},'
+                ' "generalDiagnostics": ['
+                '  {"rule": "reportMissingImports", "severity": "warning"}]}'
+            ),
+            stderr="",
+            duration=0.5,
+        ),
+    )
+    data, _ = typecheck.collect(["pkg"], tool_name="pyright")
+    assert data["import_errors"] == 0, "a warning is not an error"
+    assert data["errors_excluding_imports"] == 0
+    assert data["errors_excluding_imports"] >= 0
+
+
+def test_nested_junit_suites_are_not_double_counted(tmp_path):
+    """A parent suite's counters already include its children's."""
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        '<testsuites>'
+        '  <testsuite name="all" tests="4" failures="1" errors="0" skipped="0" time="2.0">'
+        '    <testsuite name="a" tests="2" failures="1" errors="0" skipped="0" time="1.0"/>'
+        '    <testsuite name="b" tests="2" failures="0" errors="0" skipped="0" time="1.0"/>'
+        '  </testsuite>'
+        '</testsuites>'
+    )
+    data, tool = tests_cov.collect(junit_path=str(report))
+    assert tool.status == "ok"
+    assert data["total"] == 4, "the two leaf suites, not the parent as well"
+    assert data["failed"] == 1
+    assert data["passed"] == 3
+
+
+def test_flat_junit_reports_still_sum_correctly(tmp_path):
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        '<testsuites>'
+        '<testsuite tests="3" failures="0" errors="0" skipped="1" time="1.0"/>'
+        '<testsuite tests="2" failures="1" errors="0" skipped="0" time="0.5"/>'
+        '</testsuites>'
+    )
+    data, _ = tests_cov.collect(junit_path=str(report))
+    assert data["total"] == 5
+    assert data["passed"] == 3

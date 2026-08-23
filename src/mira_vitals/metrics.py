@@ -102,52 +102,60 @@ class CardinalityError(ValueError):
 #: ``path`` is the dotted location of the value inside the canonical snapshot,
 #: which keeps the metric stream provably derived from the artifact rather than
 #: separately computed.
+#:
+#: ``status`` names the section whose status governs the value.  A metric point
+#: carries no status of its own, so a partial measurement exported as an
+#: ordinary point is *indistinguishable from a complete one* forever after --
+#: and the radon adapters deliberately keep the files they did parse while
+#: marking the tool ``error``, which is exactly how a partial LOC total would
+#: otherwise reach the series.  Suppression is the only safe direction: a gap
+#: says "not measured", which is true, whereas a number says something false.
 METRICS: tuple[dict[str, Any], ...] = (
-    {"name": "code.health.loc", "path": "summary.loc", "unit": "{line}", "kind": "gauge",
+    {"name": "code.health.loc", "path": "summary.loc", "status": "summary.status", "unit": "{line}", "kind": "gauge",
      "description": "Physical lines of code, including comments and blanks."},
-    {"name": "code.health.source_loc", "path": "summary.source_loc", "unit": "{line}", "kind": "gauge",
+    {"name": "code.health.source_loc", "path": "summary.source_loc", "status": "summary.status", "unit": "{line}", "kind": "gauge",
      "description": "Source lines of code, excluding comments and blank lines."},
-    {"name": "code.health.files", "path": "summary.files", "unit": "{file}", "kind": "gauge",
+    {"name": "code.health.files", "path": "summary.files", "status": "summary.status", "unit": "{file}", "kind": "gauge",
      "description": "Number of analyzed source files."},
-    {"name": "code.health.functions", "path": "summary.functions", "unit": "{function}", "kind": "gauge",
+    {"name": "code.health.functions", "path": "summary.functions", "status": "complexity.status", "unit": "{function}", "kind": "gauge",
      "description": "Number of functions, methods and closures analyzed."},
 
-    {"name": "code.health.complexity.total", "path": "complexity.aggregate", "unit": "{branch}", "kind": "gauge",
+    {"name": "code.health.complexity.total", "status": "complexity.status", "path": "complexity.aggregate", "unit": "{branch}", "kind": "gauge",
      "description": "Sum of cyclomatic complexity over all analyzed functions."},
-    {"name": "code.health.complexity.mean", "path": "complexity.mean", "unit": "{branch}", "kind": "gauge",
+    {"name": "code.health.complexity.mean", "status": "complexity.status", "path": "complexity.mean", "unit": "{branch}", "kind": "gauge",
      "description": "Arithmetic mean cyclomatic complexity per function."},
-    {"name": "code.health.complexity.p50", "path": "complexity.p50", "unit": "{branch}", "kind": "gauge",
+    {"name": "code.health.complexity.p50", "status": "complexity.status", "path": "complexity.p50", "unit": "{branch}", "kind": "gauge",
      "description": "50th percentile cyclomatic complexity (nearest-rank)."},
-    {"name": "code.health.complexity.p90", "path": "complexity.p90", "unit": "{branch}", "kind": "gauge",
+    {"name": "code.health.complexity.p90", "status": "complexity.status", "path": "complexity.p90", "unit": "{branch}", "kind": "gauge",
      "description": "90th percentile cyclomatic complexity (nearest-rank)."},
-    {"name": "code.health.complexity.p95", "path": "complexity.p95", "unit": "{branch}", "kind": "gauge",
+    {"name": "code.health.complexity.p95", "status": "complexity.status", "path": "complexity.p95", "unit": "{branch}", "kind": "gauge",
      "description": "95th percentile cyclomatic complexity (nearest-rank)."},
-    {"name": "code.health.complexity.max", "path": "complexity.max", "unit": "{branch}", "kind": "gauge",
+    {"name": "code.health.complexity.max", "status": "complexity.status", "path": "complexity.max", "unit": "{branch}", "kind": "gauge",
      "description": "Highest cyclomatic complexity of any analyzed function."},
-    {"name": "code.health.complexity.density", "path": "complexity.density_per_kloc", "unit": "{branch}/kLOC",
+    {"name": "code.health.complexity.density", "status": "complexity.status", "path": "complexity.density_per_kloc", "unit": "{branch}/kLOC",
      "kind": "gauge",
      "description": "Aggregate cyclomatic complexity per 1000 source lines."},
 
-    {"name": "code.health.functions.high_complexity", "path": "complexity.functions_gt_10", "unit": "{function}",
+    {"name": "code.health.functions.high_complexity", "status": "complexity.status", "path": "complexity.functions_gt_10", "unit": "{function}",
      "kind": "gauge", "description": "Functions with cyclomatic complexity above 10."},
 
-    {"name": "code.health.maintainability.index", "path": "maintainability.mean_index", "unit": "1", "kind": "gauge",
+    {"name": "code.health.maintainability.index", "path": "maintainability.mean_index", "status": "maintainability.status", "unit": "1", "kind": "gauge",
      "description": "Unweighted mean of radon's per-file maintainability index."},
 
-    {"name": "code.health.lint.issues", "path": "lint.total", "unit": "{issue}", "kind": "gauge",
+    {"name": "code.health.lint.issues", "path": "lint.total", "status": "lint.status", "unit": "{issue}", "kind": "gauge",
      "description": "Lint findings across the analyzed paths."},
-    {"name": "code.health.type.errors", "path": "typing.errors", "unit": "{issue}", "kind": "gauge",
+    {"name": "code.health.type.errors", "path": "typing.errors", "status": "typing.status", "unit": "{issue}", "kind": "gauge",
      "description": "Type-checker errors."},
-    {"name": "code.health.type.warnings", "path": "typing.warnings", "unit": "{issue}", "kind": "gauge",
+    {"name": "code.health.type.warnings", "path": "typing.warnings", "status": "typing.status", "unit": "{issue}", "kind": "gauge",
      "description": "Type-checker warnings."},
 
-    {"name": "code.health.test.passed", "path": "tests.passed", "unit": "{test}", "kind": "gauge",
+    {"name": "code.health.test.passed", "status": "tests.status", "path": "tests.passed", "unit": "{test}", "kind": "gauge",
      "description": "Passing tests in the run that produced the consumed report."},
-    {"name": "code.health.test.failed", "path": "tests.failed", "unit": "{test}", "kind": "gauge",
+    {"name": "code.health.test.failed", "status": "tests.status", "path": "tests.failed", "unit": "{test}", "kind": "gauge",
      "description": "Failing tests."},
-    {"name": "code.health.test.skipped", "path": "tests.skipped", "unit": "{test}", "kind": "gauge",
+    {"name": "code.health.test.skipped", "status": "tests.status", "path": "tests.skipped", "unit": "{test}", "kind": "gauge",
      "description": "Skipped tests."},
-    {"name": "code.health.coverage", "path": "tests.coverage_percent", "unit": "%", "kind": "gauge",
+    {"name": "code.health.coverage", "status": "tests.status", "path": "tests.coverage_percent", "unit": "%", "kind": "gauge",
      "description": "Line coverage percentage."},
 )
 

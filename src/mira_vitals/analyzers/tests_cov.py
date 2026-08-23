@@ -108,11 +108,20 @@ def _parse_junit(path: str) -> dict[str, Any]:
     """Sum JUnit counters across suites.
 
     pytest emits a single ``<testsuite>`` wrapped in ``<testsuites>``; other
-    runners emit several.  Summing the roots' own attributes would double-count
-    when the wrapper repeats them, so only ``testsuite`` elements are read.
+    runners emit several, and some nest them.  Two ways to double-count here:
+
+    * summing the ``<testsuites>`` root's own attributes as well as its
+      children, when the wrapper repeats their totals; and
+    * summing a parent ``<testsuite>`` together with the child suites nested
+      inside it, whose tests the parent's counters already include.
+
+    Only *leaf* suites -- those containing no nested ``<testsuite>`` -- are
+    summed, which is correct for both flat and hierarchical reports.
     """
     root = ET.parse(path).getroot()
-    suites = root.iter("testsuite") if root.tag == "testsuites" else [root]
+    candidates = list(root.iter("testsuite")) if root.tag == "testsuites" else [root]
+    # A suite that contains another suite is an aggregate of it.
+    suites = [s for s in candidates if s.find("testsuite") is None]
 
     totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
     duration = 0.0

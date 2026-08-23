@@ -73,10 +73,26 @@ def build_metric_points(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     recorded as zero.  A gap in a time series says "not measured"; a zero says
     "measured, and it was zero", and conflating them would make every analyzer
     outage look like a sudden improvement.
+
+    The same reasoning extends to a section whose analyzer *degraded*.  The
+    radon adapters keep the files they successfully parsed while marking the
+    tool ``error``, so a partial LOC or complexity aggregate is a real number
+    computed over an incomplete input.  Exported as an ordinary point it is
+    indistinguishable from a complete measurement for the life of the series,
+    and the run's own exit code cannot help -- telemetry is sent before the
+    failure is acted on, and a metric point carries no status.  So any metric
+    whose governing section is not ``ok`` is suppressed.
     """
     attributes = metric_registry.metric_attributes(snapshot)
     points = []
     for spec in METRICS:
+        status_path = spec.get("status")
+        if status_path is not None:
+            status = _dotted(snapshot, status_path)
+            # `None` means the section declares no status, which only the
+            # hand-built fixtures do; a real snapshot always sets one.
+            if status is not None and status != "ok":
+                continue
         value = _dotted(snapshot, spec["path"])
         if value is None or isinstance(value, bool):
             continue

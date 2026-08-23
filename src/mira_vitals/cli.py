@@ -168,6 +168,7 @@ def collect_snapshot(
         security=security,
         tools=tools,
         complexity_status=radon_tool.status,
+        summary_status=raw_tool.status,
         maintainability_status=mi_tool.status,
         halstead_status=hal_tool.status,
         hotspot_limit=config.hotspot_limit,

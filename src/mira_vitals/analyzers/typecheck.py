@@ -22,6 +22,17 @@ from typing import Any
 
 from .base import ToolRun, run, tool_version, which
 
+#: pyright exit codes that mean "the checker ran".  0 = no diagnostics,
+#: 1 = diagnostics reported.  2 (fatal), 3 (config parse error) and 4 (invalid
+#: parameters) all mean it did not.
+PYRIGHT_DIAGNOSTIC_EXIT_CODES: frozenset[int] = frozenset({0, 1})
+
+#: Diagnostics whose cause is the environment rather than the code.
+IMPORT_RULES: frozenset[str] = frozenset({"reportMissingImports", "reportMissingModuleSource"})
+
+#: mypy's equivalents.
+MYPY_IMPORT_RULES: frozenset[str] = frozenset({"import-not-found", "import-untyped"})
+
 _MYPY_LINE = re.compile(r"^(?P<path>[^:]+):(?P<line>\d+):(?:\d+:)?\s*(?P<sev>error|warning|note):\s*(?P<msg>.*?)(?:\s+\[(?P<rule>[\w-]+)\])?$")
 
 
@@ -53,8 +64,21 @@ def _collect_pyright(paths: list[str], *, cwd: str | None) -> tuple[dict[str, An
     result = run(argv, cwd=cwd)
     tool.exit_code = result.returncode
     tool.duration_seconds = result.duration
-    # pyright exits 1 when it reports diagnostics: a successful run with
-    # findings, not a failure.  Only an unparseable payload is a real error.
+    # pyright exits 0 with no diagnostics and 1 when it reports some: both are
+    # successful runs.  Anything else is a failure of the tool itself -- and it
+    # still writes a well-formed, *zero-error* JSON summary while doing so.
+    # Verified: a malformed pyrightconfig.json yields exit 3, the parse error on
+    # stderr, and `{"summary": {"errorCount": 0, ...}}` on stdout.  Trusting the
+    # parseable payload therefore records a clean bill of health for a checker
+    # that never really ran, which is the worst failure this tool can have.
+    if result.returncode not in PYRIGHT_DIAGNOSTIC_EXIT_CODES:
+        tool.status = "error"
+        tool.error = (
+            f"pyright exited {result.returncode}: "
+            f"{(result.stderr or result.stdout).strip()[:1000]}"
+        )
+        return _empty("pyright", "error", tool.error), tool
+
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -64,10 +88,21 @@ def _collect_pyright(paths: list[str], *, cwd: str | None) -> tuple[dict[str, An
 
     summary = payload.get("summary", {})
     by_rule: Counter[str] = Counter()
+    # Counted separately and only at error severity.  `errors` below is
+    # pyright's error-only total, so subtracting an all-severity import count
+    # from it can go negative -- a repository that downgrades
+    # reportMissingImports to a warning would report zero errors and one
+    # warning, giving errors_excluding_imports = -1.
+    import_errors = 0
     for diagnostic in payload.get("generalDiagnostics", []):
-        by_rule[diagnostic.get("rule") or diagnostic.get("severity", "unknown")] += 1
+        rule = diagnostic.get("rule") or diagnostic.get("severity", "unknown")
+        by_rule[rule] += 1
+        if (
+            rule in IMPORT_RULES
+            and diagnostic.get("severity") == "error"
+        ):
+            import_errors += 1
 
-    import_errors = by_rule.get("reportMissingImports", 0) + by_rule.get("reportMissingModuleSource", 0)
     errors = summary.get("errorCount")
     return (
         {
@@ -108,6 +143,7 @@ def _collect_mypy(paths: list[str], *, cwd: str | None) -> tuple[dict[str, Any],
         return _empty("mypy", "error", tool.error), tool
 
     errors = warnings = 0
+    import_errors = 0
     by_rule: Counter[str] = Counter()
     files: set[str] = set()
     for line in result.stdout.splitlines():
@@ -118,13 +154,15 @@ def _collect_mypy(paths: list[str], *, cwd: str | None) -> tuple[dict[str, Any],
         if severity == "note":
             continue
         files.add(match.group("path"))
-        by_rule[match.group("rule") or severity] += 1
+        rule = match.group("rule") or severity
+        by_rule[rule] += 1
         if severity == "error":
             errors += 1
+            if rule in MYPY_IMPORT_RULES:
+                import_errors += 1
         else:
             warnings += 1
 
-    import_errors = by_rule.get("import-not-found", 0) + by_rule.get("import-untyped", 0)
     return (
         {
             "status": "ok",

@@ -38,6 +38,16 @@ def _git(args: list[str], *, cwd: str | None = None) -> str | None:
     return result.stdout.strip() or None
 
 
+def _repository_from_remote(url: str | None) -> str | None:
+    """``owner/name`` from a git remote URL, for runs outside CI."""
+    if not url:
+        return None
+    trimmed = url.removesuffix(".git").rstrip("/")
+    # Handles https://host/owner/name and git@host:owner/name alike.
+    parts = trimmed.replace(":", "/").split("/")
+    return "/".join(parts[-2:]) if len(parts) >= 2 else None
+
+
 def collect(
     env: dict[str, str] | None = None,
     *,
@@ -48,10 +58,18 @@ def collect(
     env = dict(os.environ if env is None else env)
 
     github_repository = env.get("GITHUB_REPOSITORY")  # "owner/name"
+    # The full `owner/name`, not the basename.  Two organisations can both have
+    # a repository called `backend`; reduced to the basename they share a
+    # `service.name`, so their metric series merge, and -- if one is a fork at
+    # the same commit and analyzed tree -- they produce the same
+    # `observation_id`, so a receiver deduplicating on it discards one
+    # repository's measurement as a replay of the other's.
     repository = (
         repository_override
+        or env.get("MIRA_VITALS_REPOSITORY")
         or env.get("CODE_HEALTH_REPOSITORY")
-        or (github_repository.split("/")[-1] if github_repository else None)
+        or github_repository
+        or _repository_from_remote(_git(["config", "--get", "remote.origin.url"], cwd=repo_root))
         or os.path.basename(os.path.abspath(repo_root or "."))
     )
     server = env.get("GITHUB_SERVER_URL", "https://github.com")
