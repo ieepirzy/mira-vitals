@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: pip install -e ".[dev,analyzers,otel,mypy]"
+      # Coverage is measured on every leg so the command stays identical across
+      # the matrix; only 3.12's reports are published, because the snapshot
+      # needs one deterministic source. Without --cov this package reported its
+      # own coverage as n/a, which is honest but leaves the dogfooding
+      # incomplete -- a collector that does not measure its own test coverage
+      # is not fully eating what it serves.
+      - name: Run tests
+        run: |
+          pytest -q --tb=short \
+            --junitxml=reports/junit.xml \
+            --cov=mira_vitals --cov-report=xml:reports/coverage.xml
+      - name: Publish the reports the code-health lane consumes
+        if: always() && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-py312
+          path: reports/
+          retention-days: 7
+
+  # This package measures itself. Dogfooding is not a gimmick: a metric
+  # definition nobody applies to their own code is one nobody has checked, and
+  # a collector that cannot pass its own gate has no business gating anyone's.
+  code-health:
+    name: Code health (self)
+    needs: [test]
+    if: always()
+    # A called reusable workflow's jobs cannot request permissions greater than
+    # the calling job's, and exceeding them fails the run before any job
+    # starts -- with `startup_failure` and no log to read, which is how this
+    # was found. measure.yml needs `actions: read` for the baseline artifact,
+    # so the caller has to grant it here rather than relying on the
+    # workflow-level `contents: read` above.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    uses: ./.github/workflows/measure.yml
+    with:
+      # This repository is the package. Installing it from PyPI would be
+      # circular -- and impossible before the first release.
+      install-from-checkout: true
+      reports-artifact: test-reports-py312
+      tests-python-version: "3.12"
+      gate: true
+    secrets: inherit
