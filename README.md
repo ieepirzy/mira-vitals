@@ -135,8 +135,14 @@ Its own `MIRA_VITALS_*` variables (`AUTHORING_MODE`, `PR_LABELS`,
 jobs:
   code-health:
     uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@main
+    permissions:            # a called workflow cannot exceed its caller's grant
+      contents: read
+      actions: read
+      pull-requests: read
     with:
-      paths-artifact: test-reports-py312   # optional: JUnit + coverage
+      project-install: "-e .[dev]"        # so the type checker resolves imports
+      reports-artifact: test-reports-py312 # JUnit + coverage from your test job
+      tests-python-version: "3.12"
       gate: true
     secrets: inherit
 ```

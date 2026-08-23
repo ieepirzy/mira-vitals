@@ -41,9 +41,21 @@ jobs:
     name: Code health (self)
     needs: [test]
     if: always()
+    # A called reusable workflow's jobs cannot request permissions greater than
+    # the calling job's, and exceeding them fails the run before any job
+    # starts -- with `startup_failure` and no log to read, which is how this
+    # was found. measure.yml needs `actions: read` for the baseline artifact,
+    # so the caller has to grant it here rather than relying on the
+    # workflow-level `contents: read` above.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
     uses: ./.github/workflows/measure.yml
     with:
-      config-paths: "-e .[dev]"
+      # This repository is the package. Installing it from PyPI would be
+      # circular -- and impossible before the first release.
+      install-from-checkout: true
       reports-artifact: test-reports-py312
       tests-python-version: "3.12"
       gate: true

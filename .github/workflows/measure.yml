@@ -21,10 +21,14 @@ on:
         description: "Interpreter used to run the analyzers."
         type: string
         default: "3.12"
-      config-paths:
-        description: "Extra pip install target, e.g. '-e .[dev]', so the type checker resolves the project's imports."
+      project-install:
+        description: "How to install the analyzed project itself so the type checker resolves its imports, e.g. '-e .[dev]' or '-r requirements.txt'. Without it the error count is dominated by unresolved imports and is not comparable with a run that has them."
         type: string
         default: ""
+      install-from-checkout:
+        description: "Install the collector from this checkout rather than from PyPI. For this repository's own CI, where installing from PyPI would be circular."
+        type: boolean
+        default: false
       reports-artifact:
         description: "Artifact holding junit.xml and coverage.xml from the gating test job. Omitted means tests are recorded as skipped."
         type: string
@@ -74,12 +78,17 @@ jobs:
 
       - name: Install the collector and its analyzers
         run: |
-          pip install "${{ inputs.mira-vitals-version }}[analyzers,otel]"
-          # The project's own dependencies, so the type checker resolves its
-          # imports. Without them the error count is dominated by
-          # reportMissingImports and is not comparable with a run that has them.
-          if [ -n "${{ inputs.config-paths }}" ]; then
-            pip install ${{ inputs.config-paths }}
+          set -euo pipefail
+          if [ "${{ inputs.install-from-checkout }}" = "true" ]; then
+            pip install -e ".[analyzers,otel]"
+          else
+            pip install "${{ inputs.mira-vitals-version }}[analyzers,otel]"
+          fi
+          # The analyzed project's own dependencies. Without them the type
+          # checker's error count is dominated by unresolved imports and is not
+          # comparable with a run that has them.
+          if [ -n "${{ inputs.project-install }}" ]; then
+            pip install ${{ inputs.project-install }}
           fi
 
       - name: Fetch the reports the gating test run produced
