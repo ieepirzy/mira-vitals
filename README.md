@@ -134,7 +134,7 @@ Its own `MIRA_VITALS_*` variables (`AUTHORING_MODE`, `PR_LABELS`,
 ```yaml
 jobs:
   code-health:
-    uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@main
+    uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@main   # pin to a tag once released
     permissions:            # a called workflow cannot exceed its caller's grant
       contents: read
       actions: read

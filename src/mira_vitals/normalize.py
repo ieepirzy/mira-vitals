@@ -219,7 +219,11 @@ def build(
 
     document = {
         "schema_version": schema.SCHEMA_VERSION,
-        "generated_by": {"name": "code-health", "version": __version__},
+        # Names the package that actually produced the snapshot. The telemetry
+        # namespace stays `code.health.*` -- that is a data contract describing
+        # the measurement, not the producer, and the two are deliberately
+        # allowed to differ.
+        "generated_by": {"name": "mira-vitals", "version": __version__},
         "definitions": dict(DEFINITIONS),
         "run": run,
         "ci": ci,

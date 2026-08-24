@@ -25,7 +25,10 @@ from .config import Config, load as load_config
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="code-health", description=__doc__.splitlines()[0])
+    # Matches the console script, so `mira-vitals --help` does not print usage
+    # for a command that no longer exists. The telemetry namespace stays
+    # `code.health.*`, which is a data contract rather than a command name.
+    parser = argparse.ArgumentParser(prog="mira-vitals", description=__doc__.splitlines()[0])
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--output", default="code-health.json", help="Canonical artifact path.")
     parser.add_argument("--baseline", help="Previous snapshot to compute deltas against.")
@@ -74,16 +77,16 @@ def _load_baseline(path: str | None, log: Any) -> dict[str, Any] | None:
     if not path:
         return None
     if not os.path.exists(path):
-        log(f"code-health: no baseline at {path}; deltas will be reported as unavailable")
+        log(f"mira-vitals: no baseline at {path}; deltas will be reported as unavailable")
         return None
     try:
         with open(path, encoding="utf-8") as handle:
             baseline = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
-        log(f"code-health: baseline at {path} could not be read ({exc}); deltas unavailable")
+        log(f"mira-vitals: baseline at {path} could not be read ({exc}); deltas unavailable")
         return None
     if not isinstance(baseline, dict) or "schema_version" not in baseline:
-        log(f"code-health: baseline at {path} is not a code-health snapshot; deltas unavailable")
+        log(f"mira-vitals: baseline at {path} is not a code-health snapshot; deltas unavailable")
         return None
     return baseline
 
@@ -231,7 +234,7 @@ def _gate(snapshot: dict[str, Any], config: Config, log: Any) -> list[str]:
     lint = snapshot["lint"]
     if lint.get("status") == "ok" and lint.get("gate_errors") and not config.lint_blocking:
         log(
-            f"code-health: ruff reports {lint['gate_errors']} finding(s) in the gated paths "
+            f"mira-vitals: ruff reports {lint['gate_errors']} finding(s) in the gated paths "
             f"-- measured, not blocking (set lint_blocking = true once the baseline is clean)"
         )
     elif lint.get("status") == "ok" and lint.get("gate_errors"):
@@ -241,7 +244,7 @@ def _gate(snapshot: dict[str, Any], config: Config, log: Any) -> list[str]:
         )
     elif lint.get("status") == "ok" and lint.get("errors"):
         log(
-            f"code-health: ruff reports {lint['errors']} blocking-class finding(s), "
+            f"mira-vitals: ruff reports {lint['errors']} blocking-class finding(s), "
             f"none inside the gated paths {lint.get('gate_paths')} -- measured, not blocking"
         )
 
@@ -250,7 +253,7 @@ def _gate(snapshot: dict[str, Any], config: Config, log: Any) -> list[str]:
         violations.append(f"{typing_result['tool']}: {typing_result['errors']} type error(s)")
     elif typing_result.get("status") == "ok" and typing_result.get("errors"):
         log(
-            f"code-health: {typing_result['tool']} reports {typing_result['errors']} error(s) "
+            f"mira-vitals: {typing_result['tool']} reports {typing_result['errors']} error(s) "
             f"-- measured, not blocking (set tool.code_health.typecheck_blocking to gate)"
         )
 
@@ -283,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
 
     with open(os.path.join(args.repo_root, args.output), "w", encoding="utf-8") as handle:
         handle.write(schema.dumps(snapshot))
-    log(f"code-health: wrote {args.output} (schema v{snapshot['schema_version']})")
+    log(f"mira-vitals: wrote {args.output} (schema v{snapshot['schema_version']})")
 
     log("")
     log(report.summary_text(snapshot))
@@ -302,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
     telemetry: dict[str, Any] = {}
     if args.emit_otlp:
         telemetry["otlp"] = exporter.export(snapshot, max_detail_events=config.max_detail_events)
-        log(f"code-health: OTLP export {telemetry['otlp']['status']} "
+        log(f"mira-vitals: OTLP export {telemetry['otlp']['status']} "
             f"({telemetry['otlp']['metrics_exported']} metrics, {telemetry['otlp']['events_exported']} events)")
     exporter.shutdown_tracing()
 
@@ -313,21 +316,21 @@ def main(argv: list[str] | None = None) -> int:
         # the policy below owns the exit code, which is the whole point of
         # keeping policy in one place.
         telemetry["http"] = emit_module.emit(snapshot, log=log)
-        log(f"code-health: HTTP emission {telemetry['http']['status']}")
+        log(f"mira-vitals: HTTP emission {telemetry['http']['status']}")
 
     exit_code = 0
 
     failures = _analyzer_failures(snapshot, type_checker=args.type_checker or config.type_checker)
     if failures:
         for failure in failures:
-            log(f"code-health: ANALYZER FAILURE -- {failure}")
+            log(f"mira-vitals: ANALYZER FAILURE -- {failure}")
         if args.fail_on_analyzer_error:
             exit_code = 2
 
     if args.gate:
         violations = _gate(snapshot, config, log)
         for violation in violations:
-            log(f"code-health: GATE FAILURE -- {violation}")
+            log(f"mira-vitals: GATE FAILURE -- {violation}")
         if violations:
             exit_code = max(exit_code, 1)
 
@@ -340,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
             if telemetry.get(channel, {}).get("status") == "error"
         ]
         if failed:
-            log(f"code-health: telemetry emission failed on {', '.join(failed)} (blocking)")
+            log(f"mira-vitals: telemetry emission failed on {', '.join(failed)} (blocking)")
             exit_code = max(exit_code, 3)
 
     return exit_code

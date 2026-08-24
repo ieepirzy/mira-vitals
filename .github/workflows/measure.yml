@@ -44,10 +44,29 @@ on:
       default-branch:
         type: string
         default: "main"
-      mira-vitals-version:
-        description: "Pin the collector. Upgrading is a deliberate act; it shows in the series as a step change."
+      collector-requirement:
+        description: >-
+          The full pip requirement for the collector, extras included. A
+          complete requirement rather than a bare version because a PEP 508 URL
+          spec puts its extras before the `@`, which a
+          "{version}[analyzers,otel]" template cannot express.
+          Upgrading is a deliberate act; it shows in the series as a step
+          change, with the new analyzer versions recorded beside it.
         type: string
-        default: "mira-vitals"
+        # Installed from git rather than PyPI: the package is not published
+        # yet, and the repository is public so this needs no credential.
+        #
+        # `@main` rather than a tag, deliberately and temporarily. Pinning to a
+        # tag that does not exist would make every consumer's CI red for a
+        # reason outside its own diff. Reproducibility of the *measurement*
+        # does not depend on this: the analyzer versions are pinned inside the
+        # package, and `generated_by.version` records which collector ran.
+        #
+        # FOLLOW-UP once v0.1.0 is released: change this to
+        # "mira-vitals[analyzers,otel]" and have consumers reference
+        # `measure.yml@v0.1.0`. Consumers never name the install source -- it
+        # lives here -- so that is a one-line change in one repository, not nine.
+        default: "mira-vitals[analyzers,otel] @ git+https://github.com/ieepirzy/mira-vitals@main"
     secrets:
       OTEL_EXPORTER_OTLP_HEADERS:
         required: false
@@ -82,7 +101,7 @@ jobs:
           if [ "${{ inputs.install-from-checkout }}" = "true" ]; then
             pip install -e ".[analyzers,otel]"
           else
-            pip install "${{ inputs.mira-vitals-version }}[analyzers,otel]"
+            pip install "${{ inputs.collector-requirement }}"
           fi
           # The analyzed project's own dependencies. Without them the type
           # checker's error count is dominated by unresolved imports and is not
