@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from typing import Any, Iterable, Sequence
 
-from . import __version__, schema
+from . import collector_identity, schema
 from .schema import DEFINITIONS
 
 
@@ -219,11 +219,11 @@ def build(
 
     document = {
         "schema_version": schema.SCHEMA_VERSION,
-        # Names the package that actually produced the snapshot. The telemetry
-        # namespace stays `code.health.*` -- that is a data contract describing
-        # the measurement, not the producer, and the two are deliberately
-        # allowed to differ.
-        "generated_by": {"name": "mira-vitals", "version": __version__},
+        # Identifies the collector that produced this snapshot, including the
+        # resolved commit when installed from VCS. The telemetry namespace
+        # stays `code.health.*` -- a data contract describing the measurement,
+        # not the producer, and the two are deliberately allowed to differ.
+        "generated_by": collector_identity(),
         "definitions": dict(DEFINITIONS),
         "run": run,
         "ci": ci,

@@ -26,6 +26,11 @@ def _get(document: dict[str, Any], path: str) -> Any:
     return node
 
 
+def _abbrev(value: str) -> str:
+    """Shorten a commit-length identifier for a human-readable reason string."""
+    return value[:12] if len(value) > 12 else value
+
+
 def _difference(current: dict[str, Any], baseline: dict[str, Any], path: str) -> float | None:
     new = _get(current, path)
     old = _get(baseline, path)
@@ -80,6 +85,16 @@ def comparability(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str
         reasons.append(f"type checker {baseline_checker} -> {current_checker}")
     # A checker's error count depends on the interpreter it resolved, so a
     # Python upgrade can move `typing.errors` with no code change at all.
+    # The collector computes the function set, the percentiles, the aggregates
+    # and the deltas themselves, so a change to it can move every number with
+    # nothing else in the snapshot differing. `revision` is the resolved commit
+    # when installed from VCS; `version` covers a release install.
+    for field, label in (("generated_by.revision", "collector revision"),
+                         ("generated_by.version", "collector version")):
+        new, old = _get(current, field), _get(baseline, field)
+        if new and old and new != old:
+            reasons.append(f"{label} {_abbrev(old)} -> {_abbrev(new)}")
+
     # `lint.total` means "findings under this rule selection". A different
     # selection is a different metric, not a movement in the same one.
     if _get(current, "lint.select") != _get(baseline, "lint.select"):

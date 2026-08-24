@@ -56,17 +56,24 @@ on:
         # Installed from git rather than PyPI: the package is not published
         # yet, and the repository is public so this needs no credential.
         #
-        # `@main` rather than a tag, deliberately and temporarily. Pinning to a
-        # tag that does not exist would make every consumer's CI red for a
-        # reason outside its own diff. Reproducibility of the *measurement*
-        # does not depend on this: the analyzer versions are pinned inside the
-        # package, and `generated_by.version` records which collector ran.
+        # Pinned to an immutable commit, not `@main`. Pinning the analyzers is
+        # not sufficient: the collector itself computes the function set, the
+        # percentiles, the aggregates and the deltas, so a change to
+        # normalization or export shifts every consumer's numbers with nothing
+        # in the snapshot to explain it. A moving ref would mean two runs
+        # executing materially different code, which is precisely the silent
+        # redefinition this package exists to prevent.
         #
-        # FOLLOW-UP once v0.1.0 is released: change this to
+        # Bumping this is the deliberate upgrade act: it appears in the series
+        # as a step change, and because `generated_by.revision` records the
+        # resolved commit, a delta across the bump is marked `incomparable`
+        # rather than presented as a movement.
+        #
+        # FOLLOW-UP once v0.1.0 is on PyPI: change to
         # "mira-vitals[analyzers,otel]" and have consumers reference
         # `measure.yml@v0.1.0`. Consumers never name the install source -- it
         # lives here -- so that is a one-line change in one repository, not nine.
-        default: "mira-vitals[analyzers,otel] @ git+https://github.com/ieepirzy/mira-vitals@main"
+        default: "mira-vitals[analyzers,otel] @ git+https://github.com/ieepirzy/mira-vitals@f45f6b30bf64e88111df44a44f2f279b902eb403"
     secrets:
       OTEL_EXPORTER_OTLP_HEADERS:
         required: false
