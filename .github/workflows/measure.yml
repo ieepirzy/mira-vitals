@@ -86,6 +86,41 @@ on:
         # `measure.yml@v0.1.0`. Consumers never name the install source -- it
         # lives here -- so that is a one-line change in one repository, not nine.
         default: "mira-vitals[analyzers,otel] @ git+https://github.com/ieepirzy/mira-vitals@ca82e5f0bfd3da46d9794a0dfb45df5d1fa49c81"
+      runner:
+        description: >-
+          The runner, as JSON, because `runs-on` takes either a single label
+          or a list and a workflow input can only be a string: '"ubuntu-latest"'
+          or '["self-hosted","some-label"]'. JSON always, rather than guessing
+          from the shape of a bare string, so there is no case where the
+          expression has to be evaluated to find out whether it parses.
+
+          Not merely a convenience: a repository whose account has exhausted
+          its included hosted minutes never gets a hosted runner assigned at
+          all -- the job is not slow, it is never scheduled -- so for those,
+          naming their own runner is the difference between this lane
+          existing and not.
+        type: string
+        default: '"ubuntu-latest"'
+      setup-python:
+        description: >-
+          Whether to install the interpreter with actions/setup-python. Turn
+          it off for a runner the action has no prebuilt interpreter for --
+          Arch, Alpine, anything not on its support matrix -- where the step
+          fails outright and the runner's own Python is what you want. When
+          off, `python-version` describes nothing and is not applied; the
+          interpreter already on PATH is used and recorded in the snapshot,
+          which is why the snapshot records it rather than assuming it.
+        type: boolean
+        default: true
+      pip-args:
+        description: >-
+          Extra arguments for every pip install here, e.g.
+          `--break-system-packages` on a distribution whose system Python is
+          marked externally managed (PEP 668). Applied to the collector, the
+          analyzers and the project's own dependencies alike, so that one
+          setting cannot leave the three installed by different rules.
+        type: string
+        default: ""
     secrets:
       OTEL_EXPORTER_OTLP_HEADERS:
         required: false
@@ -98,7 +133,7 @@ permissions:
 jobs:
   measure:
     name: Analyze and export
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner) }}
     permissions:
       contents: read
       actions: read
@@ -111,22 +146,33 @@ jobs:
           fetch-depth: 0
 
       - uses: actions/setup-python@v6
+        if: inputs.setup-python
         with:
           python-version: ${{ inputs.python-version }}
+
+      # A non-root pip on a runner without a virtualenv installs console
+      # scripts under ~/.local/bin, which is not on PATH by default -- the
+      # collector then installs successfully and is not found. Unconditional
+      # because it is inert where the directory does not exist or is already
+      # on PATH, and a conditional here would be one more thing to get wrong
+      # per runner.
+      - name: Make user-installed console scripts reachable
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install the collector and its analyzers
         run: |
           set -euo pipefail
+          PIP_EXTRA=(${{ inputs.pip-args }})
           if [ "${{ inputs.install-from-checkout }}" = "true" ]; then
-            pip install -e ".[analyzers,otel]"
+            pip install "${PIP_EXTRA[@]}" -e ".[analyzers,otel]"
           else
-            pip install "${{ inputs.collector-requirement }}"
+            pip install "${PIP_EXTRA[@]}" "${{ inputs.collector-requirement }}"
           fi
           # The analyzed project's own dependencies. Without them the type
           # checker's error count is dominated by unresolved imports and is not
           # comparable with a run that has them.
           if [ -n "${{ inputs.project-install }}" ]; then
-            pip install ${{ inputs.project-install }}
+            pip install "${PIP_EXTRA[@]}" ${{ inputs.project-install }}
           fi
 
       - name: Fetch the reports the gating test run produced
