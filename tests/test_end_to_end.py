@@ -18,14 +18,36 @@ import sys
 
 import pytest
 
+from mira_vitals import config as mv_config
 from mira_vitals import schema
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HAS_RADON = shutil.which("radon") is not None or subprocess.run(
-    [sys.executable, "-m", "radon", "--version"], capture_output=True, check=False
-).returncode == 0
 
-pytestmark = pytest.mark.skipif(not HAS_RADON, reason="radon is not installed")
+
+def _available(executable: str) -> bool:
+    if shutil.which(executable) is not None:
+        return True
+    return subprocess.run(
+        [sys.executable, "-m", executable, "--version"], capture_output=True, check=False
+    ).returncode == 0
+
+
+# Every analyzer the collector treats as required, not just radon. The origo
+# copy guarded on radon alone, which was wrong in a way that only shows up in
+# a partial environment: with radon present and ruff or the type checker
+# absent, the collector exits 2 by design ("required analyzer unavailable"),
+# the shared fixture's returncode assertion fails, and a developer who simply
+# has not installed the full analyzer set sees twelve failures rather than a
+# skip. The type checker is read from this repository's own configuration
+# rather than hardcoded, because that is what the collector will actually
+# invoke.
+_REQUIRED_TOOLS = ("radon", "ruff", mv_config.load(REPO_ROOT).type_checker)
+_MISSING_TOOLS = [tool for tool in _REQUIRED_TOOLS if not _available(tool)]
+
+pytestmark = pytest.mark.skipif(
+    bool(_MISSING_TOOLS),
+    reason=f"required analyzers not installed: {', '.join(_MISSING_TOOLS)}",
+)
 
 
 @pytest.fixture(scope="module")

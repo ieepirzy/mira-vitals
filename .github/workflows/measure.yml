@@ -204,21 +204,75 @@ jobs:
           name: ${{ inputs.reports-artifact }}
           path: reports
 
-      - name: Fetch the previous default-branch snapshot as a baseline
+      # Resolved through the REST API with Python rather than `gh`. The GitHub
+      # CLI is present on hosted runners and absent from most self-hosted
+      # ones, and the failure was silent in the worst possible way: `gh` not
+      # found made the lookup fail, `|| true` swallowed it, the empty result
+      # was reported as "no previous successful run", and every snapshot from
+      # that runner would have carried `deltas: unavailable` forever while
+      # claiming the baseline simply did not exist.
+      #
+      # That is exactly the confusion this collector exists to prevent -- a
+      # failed measurement presented as a measured absence -- so the two are
+      # now distinguished: no previous run is reported and succeeds, while a
+      # lookup that could not be performed fails the step. The step stays
+      # `continue-on-error`, because a missing baseline must never block the
+      # analysis, but a failed lookup is now visible rather than mute.
+      #
+      # Python, not curl: the interpreter is guaranteed here (the collector
+      # runs on it, and it was installed two steps ago) and curl is not.
+      - name: Resolve the previous default-branch run
+        id: baseline
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ inputs.default-branch }}
         run: |
-          set -uo pipefail
-          run_id="$(gh run list --branch '${{ inputs.default-branch }}' --status success \
-            --limit 1 --json databaseId --jq '.[0].databaseId' || true)"
-          if [ -z "${run_id:-}" ] || [ "${run_id}" = "null" ]; then
-            echo "no previous successful default-branch run; deltas will be unavailable"
-            exit 0
-          fi
-          mkdir -p baseline
-          gh run download "$run_id" --name code-health-main --dir baseline \
-            || echo "baseline artifact unavailable for run $run_id"
+          python - <<'PY'
+          import json, os, sys, urllib.error, urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          url = (
+              f"{api}/repos/{repo}/actions/runs"
+              f"?branch={os.environ['DEFAULT_BRANCH']}&status=success&per_page=1"
+          )
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  runs = json.load(response).get("workflow_runs") or []
+          except (urllib.error.URLError, OSError, ValueError) as exc:
+              # Not "no baseline" -- "could not find out". Distinct on purpose.
+              sys.exit(f"baseline lookup failed ({exc}); deltas will be unavailable")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              if runs:
+                  handle.write(f"run_id={runs[0]['id']}\n")
+                  print(f"baseline run: {runs[0]['id']}")
+              else:
+                  print("no previous successful default-branch run; deltas will be unavailable")
+          PY
+
+      # `run-id` plus a token downloads from a *different* run, which is what
+      # makes the baseline reachable without the GitHub CLI. Skipped rather
+      # than attempted when there is no run to download from, so "no baseline
+      # yet" does not surface as a failed step.
+      - name: Fetch the previous default-branch snapshot as a baseline
+        if: steps.baseline.outputs.run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: code-health-main
+          path: baseline
+          run-id: ${{ steps.baseline.outputs.run_id }}
+          github-token: ${{ github.token }}
 
       - name: Analyze, report and export
         env:
