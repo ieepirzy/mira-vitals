@@ -69,11 +69,23 @@ on:
         # resolved commit, a delta across the bump is marked `incomparable`
         # rather than presented as a movement.
         #
+        # The pin necessarily trails `main` by at least one commit: a workflow
+        # cannot name the commit that contains it. That is fine as a steady
+        # state -- it means consumers run the previous reviewed revision --
+        # but it is a trap when the *point* of a change is something the pin
+        # must carry. The first version of this pin named the commit before
+        # `generated_by.revision` existed, so every consumer produced
+        # snapshots that could not say which collector had made them, which
+        # is precisely the defect the pin was introduced to fix. It went
+        # unnoticed because this repository's own CI sets
+        # `install-from-checkout` and so never exercises this path; the step
+        # below now fails the run if a future pin regresses the same way.
+        #
         # FOLLOW-UP once v0.1.0 is on PyPI: change to
         # "mira-vitals[analyzers,otel]" and have consumers reference
         # `measure.yml@v0.1.0`. Consumers never name the install source -- it
         # lives here -- so that is a one-line change in one repository, not nine.
-        default: "mira-vitals[analyzers,otel] @ git+https://github.com/ieepirzy/mira-vitals@f45f6b30bf64e88111df44a44f2f279b902eb403"
+        default: "mira-vitals[analyzers,otel] @ git+https://github.com/ieepirzy/mira-vitals@ca82e5f0bfd3da46d9794a0dfb45df5d1fa49c81"
     secrets:
       OTEL_EXPORTER_OTLP_HEADERS:
         required: false
@@ -166,6 +178,33 @@ jobs:
           [ -f baseline/code-health.json ] && args+=(--baseline baseline/code-health.json)
           [ "${{ inputs.gate }}" = "true" ] && args+=(--gate)
           mira-vitals "${args[@]}"
+
+      # A snapshot that cannot say which collector produced it is not a
+      # measurement, it is an anecdote: the collector computes the function
+      # set, the percentiles and the aggregates, so without its revision there
+      # is no way to tell a real movement from a change in how the number is
+      # defined. `generated_by.revision` comes from PEP 610 `direct_url.json`,
+      # which pip writes only for a VCS or URL install -- so this is asserted
+      # exactly when the collector was installed from the pin, and skipped for
+      # `install-from-checkout`, where an editable install has no such record
+      # and a null revision is the honest answer.
+      - name: Verify the collector identified itself
+        if: success() && !inputs.install-from-checkout
+        run: |
+          python - <<'PY'
+          import json, sys
+          snapshot = json.load(open("code-health.json"))
+          identity = snapshot.get("generated_by") or {}
+          revision = identity.get("revision")
+          if not revision:
+              sys.exit(
+                  "code-health: the collector did not record its own revision "
+                  f"(generated_by={identity!r}). The pinned collector-requirement "
+                  "resolves to a revision that predates collector_identity(); "
+                  "advance it to one that carries it."
+              )
+          print(f"collector: {identity.get('name')} {identity.get('version')} @ {revision}")
+          PY
 
       # Always uploaded, including when the gate failed: the measurement of a
       # failing commit is exactly as valuable as that of a passing one.
