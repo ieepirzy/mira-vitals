@@ -166,3 +166,32 @@ def test_a_test_interpreter_change_makes_coverage_deltas_incomparable(snapshot_f
     result = deltas.compute(current, baseline)
     assert result["status"] == "incomparable"
     assert "test interpreter" in result["reason"]
+
+
+def test_a_collector_change_makes_deltas_incomparable(snapshot_factory):
+    """The collector computes the function set, the percentiles and the
+    aggregates, so a change to it can move every number with nothing else in
+    the snapshot differing. Pinning the analyzers does not cover this."""
+    current, baseline = snapshot_factory(), snapshot_factory()
+    current["generated_by"] = {"name": "mira-vitals", "version": "0.1.0", "revision": "b" * 40}
+    baseline["generated_by"] = {"name": "mira-vitals", "version": "0.1.0", "revision": "a" * 40}
+    result = deltas.compute(current, baseline)
+    assert result["status"] == "incomparable"
+    assert "collector revision" in result["reason"]
+
+
+def test_the_same_collector_stays_comparable(snapshot_factory):
+    current, baseline = snapshot_factory(), snapshot_factory()
+    for doc in (current, baseline):
+        doc["generated_by"] = {"name": "mira-vitals", "version": "0.1.0", "revision": "a" * 40}
+    assert deltas.compute(current, baseline)["status"] == "ok"
+
+
+def test_a_release_upgrade_also_makes_deltas_incomparable(snapshot_factory):
+    """Covers the PyPI case, where there is no revision to compare."""
+    current, baseline = snapshot_factory(), snapshot_factory()
+    current["generated_by"] = {"name": "mira-vitals", "version": "0.2.0", "revision": None}
+    baseline["generated_by"] = {"name": "mira-vitals", "version": "0.1.0", "revision": None}
+    result = deltas.compute(current, baseline)
+    assert result["status"] == "incomparable"
+    assert "collector version" in result["reason"]

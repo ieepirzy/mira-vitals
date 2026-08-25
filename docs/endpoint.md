@@ -10,7 +10,7 @@ Content-Type: application/json
 Content-Encoding: gzip
 Authorization: Bearer $CODE_HEALTH_TOKEN     (omitted when unset)
 Idempotency-Key: <run.observation_id>
-User-Agent: code-health/0.1.0
+User-Agent: mira-vitals/0.1.0
 
 <gzipped canonical snapshot>
 ```

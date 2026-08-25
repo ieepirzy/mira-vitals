@@ -64,7 +64,7 @@ def emit(
     headers = {
         "Content-Type": "application/json",
         "Content-Encoding": "gzip",
-        "User-Agent": "code-health/0.1.0",
+        "User-Agent": "mira-vitals/0.1.0",
         # Lets the receiver reject a duplicate ingestion of the same analysis
         # without parsing the body.
         "Idempotency-Key": snapshot["run"]["observation_id"],
@@ -101,15 +101,15 @@ def emit(
 
         if attempt < max_attempts:
             backoff = 2 ** (attempt - 1)
-            log(f"code-health: telemetry POST failed ({last_error}); retrying in {backoff}s")
+            log(f"mira-vitals: telemetry POST failed ({last_error}); retrying in {backoff}s")
             time.sleep(backoff)
 
     status["status"] = "error"
     status["error"] = last_error
     log(
-        f"code-health: telemetry emission failed after {status['attempts']} attempt(s): "
+        f"mira-vitals: telemetry emission failed after {status['attempts']} attempt(s): "
         f"{last_error} (endpoint={endpoint}, token={_redact(token)})"
     )
     if blocking:
-        raise RuntimeError(f"code-health telemetry emission failed: {last_error}")
+        raise RuntimeError(f"mira-vitals telemetry emission failed: {last_error}")
     return status
