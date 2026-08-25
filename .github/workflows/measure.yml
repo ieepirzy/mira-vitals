@@ -4,10 +4,31 @@ name: Code health (reusable)
 #
 #   jobs:
 #     code-health:
-#       uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@main
+#       permissions:
+#         contents: read
+#         actions: read          # the previous run's baseline artifact
+#         pull-requests: read    # provenance labels
+#       uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@<commit-sha>
 #       with:
 #         gate: true
-#       secrets: inherit
+#       secrets:
+#         OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+#         CODE_HEALTH_TOKEN: ${{ secrets.CODE_HEALTH_TOKEN }}
+#
+# A commit SHA, not `@main`: `uses:` on a mutable ref executes whatever that
+# branch holds at run time, inside the consumer's runner and with the
+# consumer's credentials, so a change here would take effect there with no
+# reviewed change there. It is also the same argument that pins the collector
+# package below -- a moving reference means two runs can execute materially
+# different measurement code with nothing in the snapshot to explain the shift.
+#
+# Named secrets, not `secrets: inherit`: `inherit` forwards every secret the
+# calling repository holds across a repository boundary. This workflow declares
+# exactly the two above, both optional, and needs nothing else.
+#
+# The `permissions:` block is not optional either. A called workflow's jobs
+# cannot request more than the calling job holds, and exceeding it fails the
+# run before any job starts -- `startup_failure`, with no log to read.
 #
 # A reusable workflow shares the caller's workflow run, so it can download an
 # artifact the caller's own test job published in that same run. That is what
