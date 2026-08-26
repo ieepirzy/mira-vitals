@@ -254,7 +254,8 @@ def _gate(snapshot: dict[str, Any], config: Config, log: Any) -> list[str]:
     elif typing_result.get("status") == "ok" and typing_result.get("errors"):
         log(
             f"mira-vitals: {typing_result['tool']} reports {typing_result['errors']} error(s) "
-            f"-- measured, not blocking (set tool.code_health.typecheck_blocking to gate)"
+            f"-- measured, not blocking (set typecheck_blocking in "
+            f"{config.source or 'mira-vitals.toml'} to gate)"
         )
 
     tests = snapshot["tests"]

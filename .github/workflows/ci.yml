@@ -67,4 +67,10 @@ jobs:
       reports-artifact: test-reports-py312
       tests-python-version: "3.12"
       gate: true
-    secrets: inherit
+    # Named rather than `inherit`, even though this call is same-repo and
+    # same-commit and so carries none of the cross-repository trust problem.
+    # The example a consumer copies is the one in measure.yml's header, but
+    # the call they are most likely to read is this one.
+    secrets:
+      OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+      CODE_HEALTH_TOKEN: ${{ secrets.CODE_HEALTH_TOKEN }}

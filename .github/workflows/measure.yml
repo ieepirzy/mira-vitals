@@ -4,10 +4,31 @@ name: Code health (reusable)
 #
 #   jobs:
 #     code-health:
-#       uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@main
+#       permissions:
+#         contents: read
+#         actions: read          # the previous run's baseline artifact
+#         pull-requests: read    # provenance labels
+#       uses: ieepirzy/mira-vitals/.github/workflows/measure.yml@<commit-sha>
 #       with:
 #         gate: true
-#       secrets: inherit
+#       secrets:
+#         OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+#         CODE_HEALTH_TOKEN: ${{ secrets.CODE_HEALTH_TOKEN }}
+#
+# A commit SHA, not `@main`: `uses:` on a mutable ref executes whatever that
+# branch holds at run time, inside the consumer's runner and with the
+# consumer's credentials, so a change here would take effect there with no
+# reviewed change there. It is also the same argument that pins the collector
+# package below -- a moving reference means two runs can execute materially
+# different measurement code with nothing in the snapshot to explain the shift.
+#
+# Named secrets, not `secrets: inherit`: `inherit` forwards every secret the
+# calling repository holds across a repository boundary. This workflow declares
+# exactly the two above, both optional, and needs nothing else.
+#
+# The `permissions:` block is not optional either. A called workflow's jobs
+# cannot request more than the calling job holds, and exceeding it fails the
+# run before any job starts -- `startup_failure`, with no log to read.
 #
 # A reusable workflow shares the caller's workflow run, so it can download an
 # artifact the caller's own test job published in that same run. That is what
@@ -69,11 +90,58 @@ on:
         # resolved commit, a delta across the bump is marked `incomparable`
         # rather than presented as a movement.
         #
+        # The pin necessarily trails `main` by at least one commit: a workflow
+        # cannot name the commit that contains it. That is fine as a steady
+        # state -- it means consumers run the previous reviewed revision --
+        # but it is a trap when the *point* of a change is something the pin
+        # must carry. The first version of this pin named the commit before
+        # `generated_by.revision` existed, so every consumer produced
+        # snapshots that could not say which collector had made them, which
+        # is precisely the defect the pin was introduced to fix. It went
+        # unnoticed because this repository's own CI sets
+        # `install-from-checkout` and so never exercises this path; the step
+        # below now fails the run if a future pin regresses the same way.
+        #
         # FOLLOW-UP once v0.1.0 is on PyPI: change to
         # "mira-vitals[analyzers,otel]" and have consumers reference
         # `measure.yml@v0.1.0`. Consumers never name the install source -- it
         # lives here -- so that is a one-line change in one repository, not nine.
-        default: "mira-vitals[analyzers,otel] @ git+https://github.com/ieepirzy/mira-vitals@f45f6b30bf64e88111df44a44f2f279b902eb403"
+        default: "mira-vitals[analyzers,otel] @ git+https://github.com/ieepirzy/mira-vitals@ca82e5f0bfd3da46d9794a0dfb45df5d1fa49c81"
+      runner:
+        description: >-
+          The runner, as JSON, because `runs-on` takes either a single label
+          or a list and a workflow input can only be a string: '"ubuntu-latest"'
+          or '["self-hosted","some-label"]'. JSON always, rather than guessing
+          from the shape of a bare string, so there is no case where the
+          expression has to be evaluated to find out whether it parses.
+
+          Not merely a convenience: a repository whose account has exhausted
+          its included hosted minutes never gets a hosted runner assigned at
+          all -- the job is not slow, it is never scheduled -- so for those,
+          naming their own runner is the difference between this lane
+          existing and not.
+        type: string
+        default: '"ubuntu-latest"'
+      setup-python:
+        description: >-
+          Whether to install the interpreter with actions/setup-python. Turn
+          it off for a runner the action has no prebuilt interpreter for --
+          Arch, Alpine, anything not on its support matrix -- where the step
+          fails outright and the runner's own Python is what you want. When
+          off, `python-version` describes nothing and is not applied; the
+          interpreter already on PATH is used and recorded in the snapshot,
+          which is why the snapshot records it rather than assuming it.
+        type: boolean
+        default: true
+      pip-args:
+        description: >-
+          Extra arguments for every pip install here, e.g.
+          `--break-system-packages` on a distribution whose system Python is
+          marked externally managed (PEP 668). Applied to the collector, the
+          analyzers and the project's own dependencies alike, so that one
+          setting cannot leave the three installed by different rules.
+        type: string
+        default: ""
     secrets:
       OTEL_EXPORTER_OTLP_HEADERS:
         required: false
@@ -86,7 +154,7 @@ permissions:
 jobs:
   measure:
     name: Analyze and export
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner) }}
     permissions:
       contents: read
       actions: read
@@ -99,22 +167,33 @@ jobs:
           fetch-depth: 0
 
       - uses: actions/setup-python@v6
+        if: inputs.setup-python
         with:
           python-version: ${{ inputs.python-version }}
+
+      # A non-root pip on a runner without a virtualenv installs console
+      # scripts under ~/.local/bin, which is not on PATH by default -- the
+      # collector then installs successfully and is not found. Unconditional
+      # because it is inert where the directory does not exist or is already
+      # on PATH, and a conditional here would be one more thing to get wrong
+      # per runner.
+      - name: Make user-installed console scripts reachable
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install the collector and its analyzers
         run: |
           set -euo pipefail
+          PIP_EXTRA=(${{ inputs.pip-args }})
           if [ "${{ inputs.install-from-checkout }}" = "true" ]; then
-            pip install -e ".[analyzers,otel]"
+            pip install "${PIP_EXTRA[@]}" -e ".[analyzers,otel]"
           else
-            pip install "${{ inputs.collector-requirement }}"
+            pip install "${PIP_EXTRA[@]}" "${{ inputs.collector-requirement }}"
           fi
           # The analyzed project's own dependencies. Without them the type
           # checker's error count is dominated by unresolved imports and is not
           # comparable with a run that has them.
           if [ -n "${{ inputs.project-install }}" ]; then
-            pip install ${{ inputs.project-install }}
+            pip install "${PIP_EXTRA[@]}" ${{ inputs.project-install }}
           fi
 
       - name: Fetch the reports the gating test run produced
@@ -125,21 +204,75 @@ jobs:
           name: ${{ inputs.reports-artifact }}
           path: reports
 
-      - name: Fetch the previous default-branch snapshot as a baseline
+      # Resolved through the REST API with Python rather than `gh`. The GitHub
+      # CLI is present on hosted runners and absent from most self-hosted
+      # ones, and the failure was silent in the worst possible way: `gh` not
+      # found made the lookup fail, `|| true` swallowed it, the empty result
+      # was reported as "no previous successful run", and every snapshot from
+      # that runner would have carried `deltas: unavailable` forever while
+      # claiming the baseline simply did not exist.
+      #
+      # That is exactly the confusion this collector exists to prevent -- a
+      # failed measurement presented as a measured absence -- so the two are
+      # now distinguished: no previous run is reported and succeeds, while a
+      # lookup that could not be performed fails the step. The step stays
+      # `continue-on-error`, because a missing baseline must never block the
+      # analysis, but a failed lookup is now visible rather than mute.
+      #
+      # Python, not curl: the interpreter is guaranteed here (the collector
+      # runs on it, and it was installed two steps ago) and curl is not.
+      - name: Resolve the previous default-branch run
+        id: baseline
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ inputs.default-branch }}
         run: |
-          set -uo pipefail
-          run_id="$(gh run list --branch '${{ inputs.default-branch }}' --status success \
-            --limit 1 --json databaseId --jq '.[0].databaseId' || true)"
-          if [ -z "${run_id:-}" ] || [ "${run_id}" = "null" ]; then
-            echo "no previous successful default-branch run; deltas will be unavailable"
-            exit 0
-          fi
-          mkdir -p baseline
-          gh run download "$run_id" --name code-health-main --dir baseline \
-            || echo "baseline artifact unavailable for run $run_id"
+          python - <<'PY'
+          import json, os, sys, urllib.error, urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          url = (
+              f"{api}/repos/{repo}/actions/runs"
+              f"?branch={os.environ['DEFAULT_BRANCH']}&status=success&per_page=1"
+          )
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  runs = json.load(response).get("workflow_runs") or []
+          except (urllib.error.URLError, OSError, ValueError) as exc:
+              # Not "no baseline" -- "could not find out". Distinct on purpose.
+              sys.exit(f"baseline lookup failed ({exc}); deltas will be unavailable")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              if runs:
+                  handle.write(f"run_id={runs[0]['id']}\n")
+                  print(f"baseline run: {runs[0]['id']}")
+              else:
+                  print("no previous successful default-branch run; deltas will be unavailable")
+          PY
+
+      # `run-id` plus a token downloads from a *different* run, which is what
+      # makes the baseline reachable without the GitHub CLI. Skipped rather
+      # than attempted when there is no run to download from, so "no baseline
+      # yet" does not surface as a failed step.
+      - name: Fetch the previous default-branch snapshot as a baseline
+        if: steps.baseline.outputs.run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: code-health-main
+          path: baseline
+          run-id: ${{ steps.baseline.outputs.run_id }}
+          github-token: ${{ github.token }}
 
       - name: Analyze, report and export
         env:
@@ -166,6 +299,33 @@ jobs:
           [ -f baseline/code-health.json ] && args+=(--baseline baseline/code-health.json)
           [ "${{ inputs.gate }}" = "true" ] && args+=(--gate)
           mira-vitals "${args[@]}"
+
+      # A snapshot that cannot say which collector produced it is not a
+      # measurement, it is an anecdote: the collector computes the function
+      # set, the percentiles and the aggregates, so without its revision there
+      # is no way to tell a real movement from a change in how the number is
+      # defined. `generated_by.revision` comes from PEP 610 `direct_url.json`,
+      # which pip writes only for a VCS or URL install -- so this is asserted
+      # exactly when the collector was installed from the pin, and skipped for
+      # `install-from-checkout`, where an editable install has no such record
+      # and a null revision is the honest answer.
+      - name: Verify the collector identified itself
+        if: success() && !inputs.install-from-checkout
+        run: |
+          python - <<'PY'
+          import json, sys
+          snapshot = json.load(open("code-health.json"))
+          identity = snapshot.get("generated_by") or {}
+          revision = identity.get("revision")
+          if not revision:
+              sys.exit(
+                  "code-health: the collector did not record its own revision "
+                  f"(generated_by={identity!r}). The pinned collector-requirement "
+                  "resolves to a revision that predates collector_identity(); "
+                  "advance it to one that carries it."
+              )
+          print(f"collector: {identity.get('name')} {identity.get('version')} @ {revision}")
+          PY
 
       # Always uploaded, including when the gate failed: the measurement of a
       # failing commit is exactly as valuable as that of a passing one.
