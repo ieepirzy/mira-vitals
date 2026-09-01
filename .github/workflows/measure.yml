@@ -51,7 +51,14 @@ on:
         type: boolean
         default: false
       reports-artifact:
-        description: "Artifact holding junit.xml and coverage.xml from the gating test job. Omitted means tests are recorded as skipped."
+        description: >-
+          Artifact holding reports from the caller's own gating jobs:
+          junit.xml and coverage.xml from the test job (omitted means tests
+          are recorded as skipped), and optionally bandit.json/semgrep.json/
+          osv.json/gitleaks.json from whichever security scanners the
+          caller already runs (omitted means security is recorded as
+          skipped -- this collector never runs those tools itself, only
+          reads their output).
         type: string
         default: ""
       tests-python-version:
@@ -296,6 +303,18 @@ jobs:
           [ -f reports/coverage.xml ] && args+=(--coverage reports/coverage.xml)
           [ -n "${{ inputs.tests-python-version }}" ] && \
             args+=(--tests-python-version "${{ inputs.tests-python-version }}")
+          # Same convention as junit/coverage above: the caller publishes
+          # these into the same reports-artifact (it already owns running
+          # Bandit/Semgrep/OSV-Scanner/Gitleaks and deciding their policy --
+          # this collector reads whatever report exists, never re-runs or
+          # re-gates them). Fixed filenames, not separate path inputs: a
+          # second knob per tool would let a caller point at a location
+          # `reports-artifact` never populated, silently producing "skipped"
+          # instead of a wiring error.
+          [ -f reports/bandit.json ]   && args+=(--bandit-json reports/bandit.json)
+          [ -f reports/semgrep.json ]  && args+=(--semgrep-json reports/semgrep.json)
+          [ -f reports/osv.json ]      && args+=(--osv-json reports/osv.json)
+          [ -f reports/gitleaks.json ] && args+=(--gitleaks-json reports/gitleaks.json)
           [ -f baseline/code-health.json ] && args+=(--baseline baseline/code-health.json)
           [ "${{ inputs.gate }}" = "true" ] && args+=(--gate)
           mira-vitals "${args[@]}"
