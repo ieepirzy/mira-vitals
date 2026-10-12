@@ -140,6 +140,16 @@ on:
           which is why the snapshot records it rather than assuming it.
         type: boolean
         default: true
+      node-version:
+        description: >-
+          Node.js to install with actions/setup-node before the analyzers run.
+          pyright runs on Node, and without one on PATH it reports itself
+          unavailable, which fails the run as a required analyzer. Set it on
+          runners with no Node of their own (the stock actions-runner image,
+          e.g. ARC scale sets); leave it empty where the runner already has
+          Node, as GitHub-hosted runners do.
+        type: string
+        default: ""
       pip-args:
         description: >-
           Extra arguments for every pip install here, e.g.
@@ -189,6 +199,11 @@ jobs:
         if: inputs.setup-python
         with:
           python-version: ${{ inputs.python-version }}
+
+      - uses: actions/setup-node@v4
+        if: inputs.node-version != ''
+        with:
+          node-version: ${{ inputs.node-version }}
 
       # A non-root pip on a runner without a virtualenv installs console
       # scripts under ~/.local/bin, which is not on PATH by default -- the
