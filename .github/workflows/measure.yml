@@ -166,6 +166,18 @@ jobs:
       contents: read
       actions: read
       pull-requests: read
+    env:
+      # pyright's PyPI wrapper fetches Node through nodeenv on first use and,
+      # unpinned, takes the newest release. Node 26 builds link
+      # libatomic.so.1, which minimal runner images (ARC's actions-runner)
+      # do not ship: node exits 127, `pyright --version` fails, and the
+      # collector reports "pyright is not installed" -- an analyzer failure
+      # on a runner that looks healthy. Pinning an LTS that does not need it
+      # keeps the type checker independent of the runner's libraries and of
+      # whichever Node happens to be newest. Verified on
+      # ghcr.io/actions/actions-runner (2026-10-12): 24.11.0 runs, 26.11.1
+      # does not.
+      PYRIGHT_PYTHON_NODE_VERSION: "24.11.0"
     steps:
       - uses: actions/checkout@v5
         with:
