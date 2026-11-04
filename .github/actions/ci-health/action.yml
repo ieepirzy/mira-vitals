@@ -26,9 +26,9 @@ description: >-
 #         OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.CODE_HEALTH_TOKEN && 'https://collector.example' || '' }}
 #         OTEL_EXPORTER_OTLP_HEADERS: Authorization=Bearer%20${{ secrets.CODE_HEALTH_TOKEN }}
 #
-# Pin by commit SHA, as for measure.yml. The collector installed is this
-# action's own checkout (`github.action_path`), so the pin covers the code
-# that measures, with no second version to keep in step.
+# Pin by commit SHA, as for measure.yml. The code that runs is this action's
+# own checkout (`github.action_path`), so the pin covers the code that
+# measures, with no second version to keep in step and nothing to install.
 #
 # Every step below ends in `exit 0` or `continue-on-error`: a missing Python,
 # a failed install or an unreachable endpoint becomes a warning, never a red
@@ -62,6 +62,11 @@ inputs:
 runs:
   using: composite
   steps:
+    # Nothing is installed. The `ci` command is stdlib-only, so it runs
+    # straight from this action's own checkout (PYTHONPATH=<checkout>/src):
+    # no venv, no pip, no package index. A venv was the first design, and on
+    # ARC's runner image it failed: python3.12 is there, ensurepip is not
+    # (Debian splits it into python3-venv).
     - id: probe
       shell: bash
       run: |
@@ -69,12 +74,13 @@ runs:
         dir="${RUNNER_TEMP:-/tmp}/mira-vitals-ci"
         echo "dir=$dir" >> "$GITHUB_OUTPUT"
         if [ -x "$dir/bin/mira-vitals" ]; then
-          echo "installed=true" >> "$GITHUB_OUTPUT"; echo "need-uv=false" >> "$GITHUB_OUTPUT"; exit 0
+          echo "ready=true" >> "$GITHUB_OUTPUT"; echo "need-uv=false" >> "$GITHUB_OUTPUT"; exit 0
         fi
         py=""
-        for c in python3.13 python3.12 python3.11 python3; do
-          if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys, venv; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
-            py="$c"; break
+        for c in python3.14 python3.13 python3.12 python3.11 python3; do
+          p="$(command -v "$c" 2>/dev/null)"
+          if [ -n "$p" ] && "$p" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+            py="$p"; break
           fi
         done
         echo "python=$py" >> "$GITHUB_OUTPUT"
@@ -85,8 +91,8 @@ runs:
         fi
         exit 0
 
-    # Runners with neither a Python >= 3.11 nor uv (ARC's stock image): uv
-    # provisions an interpreter. v6.8.0, pinned by commit.
+    # A runner with no Python >= 3.11 and no uv: uv provides an interpreter.
+    # v6.8.0, pinned by commit.
     - if: steps.probe.outputs.need-uv == 'true'
       uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
       continue-on-error: true
@@ -97,23 +103,28 @@ runs:
       env:
         MV_DIR: ${{ steps.probe.outputs.dir }}
         MV_PY: ${{ steps.probe.outputs.python }}
-        MV_INSTALLED: ${{ steps.probe.outputs.installed }}
-        MV_SRC: ${{ github.action_path }}/../../..
+        MV_READY: ${{ steps.probe.outputs.ready }}
+        MV_SRC: ${{ github.action_path }}/../../../src
       run: |
         set +e
-        if [ "$MV_INSTALLED" != "true" ]; then
-          mkdir -p "$MV_DIR/bin"
-          if [ -n "$MV_PY" ]; then
-            "$MV_PY" -m venv "$MV_DIR/venv" \
-              && "$MV_DIR/venv/bin/pip" install -q --disable-pip-version-check "$MV_SRC"
-          elif command -v uv >/dev/null 2>&1; then
-            uv venv -q --python 3.12 "$MV_DIR/venv" \
-              && uv pip install -q --python "$MV_DIR/venv/bin/python" "$MV_SRC"
+        if [ "$MV_READY" != "true" ]; then
+          py="$MV_PY"
+          if [ -z "$py" ] && command -v uv >/dev/null 2>&1; then
+            py="$(uv python find '>=3.11' 2>/dev/null)"
+            if [ -z "$py" ]; then
+              uv python install -q 3.12 >/dev/null 2>&1
+              py="$(uv python find '>=3.11' 2>/dev/null)"
+            fi
           fi
-          if [ -x "$MV_DIR/venv/bin/mira-vitals" ]; then
-            ln -sf "$MV_DIR/venv/bin/mira-vitals" "$MV_DIR/bin/mira-vitals"
+          src="$(cd "$MV_SRC" 2>/dev/null && pwd)"
+          if [ -n "$py" ] && [ -n "$src" ] && [ -f "$src/mira_vitals/ci/command.py" ]; then
+            mkdir -p "$MV_DIR/bin"
+            # Only this one wrapper goes on PATH, never an interpreter's bin
+            # directory, so the job's own python/pip are never shadowed.
+            printf '#!/usr/bin/env bash\nPYTHONPATH=%q exec %q -m mira_vitals "$@"\n' "$src" "$py" > "$MV_DIR/bin/mira-vitals"
+            chmod +x "$MV_DIR/bin/mira-vitals"
           else
-            echo "::warning title=mira-vitals ci::could not install the collector; this job is not measured"
+            echo "::warning title=mira-vitals ci::no Python >= 3.11 found; this job is not measured"
           fi
         fi
         [ -x "$MV_DIR/bin/mira-vitals" ] && echo "$MV_DIR/bin" >> "$GITHUB_PATH"

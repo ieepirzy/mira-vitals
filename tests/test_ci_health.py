@@ -584,3 +584,31 @@ def test_report_carries_selection_workers_quarantine_and_merged_pr(env, tmp_path
     assert test_row["attributes"]["ci.selection.mode"] == "selected"
     assert test_row["attributes"]["ci.merged_change.id"] == 41
     assert optimizations  # imported for the module's side-effect-free API
+
+
+def test_runs_from_a_bare_checkout_with_pythonpath_only(tmp_path):
+    """What the action does: no install, `PYTHONPATH=<checkout>/src python -m
+    mira_vitals ci ...`. The pinned ref, not any installed distribution, is
+    recorded as the revision."""
+    import os
+    import subprocess
+    import sys
+
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": src,
+        "MIRA_VITALS_CI_DIR": str(tmp_path / "state"),
+        "MIRA_VITALS_CI_REVISION": "deadbeef",
+    }
+    out = tmp_path / "doc.json"
+    for argv in (["ci", "start"], ["ci", "report", "--no-export", "--quiet", "--output", str(out)]):
+        result = subprocess.run(
+            [sys.executable, "-m", "mira_vitals", *argv], env=env, cwd=tmp_path,
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+    doc = json.loads(out.read_text())
+    assert doc["generated_by"]["revision"] == "deadbeef"
+    assert doc["generated_by"]["source"] == "action-checkout"
+    assert doc["job"]["wall_basis"] == "marks"

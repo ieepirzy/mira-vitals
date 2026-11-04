@@ -203,8 +203,12 @@ def _report(args: argparse.Namespace, env: dict[str, str]) -> None:
     runner = cgroup.delta(cgroup.read(env.get("MIRA_VITALS_CGROUP_ROOT") or cgroup.ROOT), baseline)
 
     identity = collector_identity()
-    if not identity.get("revision") and env.get("MIRA_VITALS_CI_REVISION"):
+    # The action runs the code from its own checkout, so the ref it was
+    # pinned to is the truth -- not whatever mira-vitals distribution happens
+    # to be installed on the runner, whose metadata collector_identity reads.
+    if env.get("MIRA_VITALS_CI_REVISION"):
         identity["revision"] = env["MIRA_VITALS_CI_REVISION"]
+        identity["source"] = "action-checkout"
 
     ident = _identity(env, (platform or {}).get("platform") or platform_name)
     ident["merged_pr_number"] = ((platform or {}).get("run") or {}).get("merged_pr_number")
