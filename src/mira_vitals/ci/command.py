@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import signal
 import sys
 import time
 from typing import Any
@@ -22,9 +24,29 @@ DEFAULT_BUDGET_SECONDS = 60.0
 DEFAULT_MAX_TESTS = 20000
 
 
+_CONTROL = re.compile(r"[\x00-\x1f\x7f\u2028\u2029\u0085]")
+
+
+def _line(text: Any) -> str:
+    """Untrusted text (test, step and job names, warnings) made safe to print.
+
+    The runner reads `::command::` workflow commands from the start of any
+    stdout line, and a test name can carry a newline (`&#10;` in JUnit XML).
+    So every control character, line and paragraph separators included,
+    becomes a space: nothing printed can start a new line.
+    """
+    return _CONTROL.sub(" ", str(text))
+
+
+def _cell(text: Any, limit: int = 160) -> str:
+    """:func:`_line`, then made safe inside a markdown table cell and code
+    span: no pipe ends the cell, no backtick ends the span."""
+    return _line(text)[:limit].replace("|", "\\|").replace("`", "'")
+
+
 def _warn(message: str) -> None:
-    # One line, no newlines: a multi-line annotation breaks the command.
-    print(f"::warning title=mira-vitals ci::{message.replace(chr(10), ' ')[:900]}", flush=True)
+    # One line: a newline in a warning would let its text start a command.
+    print(f"::warning title=mira-vitals ci::{_line(message)[:900]}", flush=True)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -127,7 +149,7 @@ def _summary_markdown(doc: dict[str, Any], export_status: dict[str, Any]) -> str
         minutes, seconds = divmod(float(value), 60)
         return f"{int(minutes)}m {seconds:04.1f}s" if minutes else f"{seconds:.1f}s"
 
-    lines = [f"### CI health: {job.get('name')}", ""]
+    lines = [f"### CI health: {_cell(job.get('name'))}", ""]
     lines.append(f"- Queue wait: **{s(job.get('queue_wait_seconds'))}** ({job.get('queue_basis') or 'no platform data'})")
     lines.append(f"- Job so far: **{s(job.get('wall_seconds'))}** ({job.get('wall_basis') or 'no clock'})")
     runner = doc["runner"] or {}
@@ -150,10 +172,10 @@ def _summary_markdown(doc: dict[str, Any], export_status: dict[str, Any]) -> str
     )[:8]
     if steps:
         lines += ["", "| Slowest steps | Time |", "|---|---|"]
-        lines += [f"| {st['name']} | {s(st['duration_seconds'])} |" for st in steps]
+        lines += [f"| {_cell(st['name'])} | {s(st['duration_seconds'])} |" for st in steps]
     if doc["phases"]:
         lines += ["", "| Phase | Time |", "|---|---|"]
-        lines += [f"| {p['name']} | {s(p['duration_seconds'])} |" for p in doc["phases"]]
+        lines += [f"| {_cell(p['name'])} | {s(p['duration_seconds'])} |" for p in doc["phases"]]
     summary = (doc["tests"] or {}).get("summary")
     if summary:
         lines += [
@@ -166,7 +188,7 @@ def _summary_markdown(doc: dict[str, Any], export_status: dict[str, Any]) -> str
             "| Slowest tests | Time |",
             "|---|---|",
         ]
-        lines += [f"| `{junit.test_id(c)[:120]}` | {s(c['duration_seconds'])} |" for c in summary["slowest"][:10]]
+        lines += [f"| `{_cell(junit.test_id(c), 120)}` | {s(c['duration_seconds'])} |" for c in summary["slowest"][:10]]
     other = [
         j
         for j in (doc.get("platform") or {}).get("jobs") or []
@@ -174,7 +196,7 @@ def _summary_markdown(doc: dict[str, Any], export_status: dict[str, Any]) -> str
     ]
     if other:
         lines += ["", "| Other jobs in this run | Queue wait | Duration |", "|---|---|---|"]
-        lines += [f"| {j['name']} | {s(j['queue_wait_seconds'])} | {s(j['duration_seconds'])} |" for j in other]
+        lines += [f"| {_cell(j['name'])} | {s(j['queue_wait_seconds'])} | {s(j['duration_seconds'])} |" for j in other]
     lines += ["", f"_Export: metrics {export_status.get('metrics')}, logs {export_status.get('logs')}._"]
     return "\n".join(lines) + "\n"
 
@@ -189,6 +211,8 @@ def _report(args: argparse.Namespace, env: dict[str, str]) -> None:
         platform, note = platforms.fetch(env, deadline)
         if platform is None and platform_name is not None:
             warnings.append(note)
+        if platform is not None:
+            warnings.extend(platform.pop("warnings", None) or [])
 
     all_marks = marks.load(env)
     cases, files, problems = junit.collect(args.junit) if args.junit else ([], [], [])
@@ -240,6 +264,7 @@ def _report(args: argparse.Namespace, env: dict[str, str]) -> None:
         warnings=warnings,
         generated_by=identity,
         optimizations=opts,
+        max_cases=max(0, args.max_tests),
     )
 
     export_status: dict[str, Any] = {"metrics": "skipped", "logs": "skipped", "notes": ["--no-export"]}
@@ -277,6 +302,20 @@ def _report(args: argparse.Namespace, env: dict[str, str]) -> None:
         _warn(message)
 
 
+def _deadline_seconds(budget: float) -> float:
+    """The whole command's wall-clock limit: the request budget plus room
+    for parsing and writing."""
+    return max(5.0, budget) + 15.0
+
+
+class _OutOfTime(Exception):
+    pass
+
+
+def _on_alarm(signum: int, frame: Any) -> None:
+    raise _OutOfTime()
+
+
 def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> int:
     """Always returns 0. See the module docstring."""
     env = dict(os.environ if env is None else env)
@@ -285,6 +324,19 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
     except SystemExit:
         _warn("bad arguments; nothing measured")
         return 0
+    # A wall-clock deadline for the whole command, on top of the per-request
+    # timeouts: parsing a huge report or a slow disk must not hold a job up
+    # either. POSIX main thread only; elsewhere the request budget still holds.
+    budget = getattr(args, "budget", DEFAULT_BUDGET_SECONDS)
+    deadline_set = False
+    previous: Any = None
+    if hasattr(signal, "SIGALRM"):
+        try:
+            previous = signal.signal(signal.SIGALRM, _on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, _deadline_seconds(budget))
+            deadline_set = True
+        except ValueError:  # not the main thread
+            pass
     try:
         if args.command == "start":
             _start(env)
@@ -294,8 +346,14 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
             _report(args, env)
         else:
             _warn("usage: mira-vitals ci start | mark <name> | report")
+    except _OutOfTime:
+        _warn(f"{args.command} ran out of its {budget:.0f} s budget; stopped, nothing more measured")
     except Exception as exc:  # noqa: BLE001 - the contract: never fail the build
         _warn(f"{args.command or 'ci'} failed: {type(exc).__name__}: {str(exc)[:300]}")
+    finally:
+        if deadline_set:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
     return 0
 
 

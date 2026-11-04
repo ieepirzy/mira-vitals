@@ -135,6 +135,11 @@ def _github(env: dict[str, str], token: str, deadline: Deadline) -> tuple[dict[s
     jobs = []
     for job in jobs_raw:
         created, started, completed = _ts(job.get("created_at")), _ts(job.get("started_at")), _ts(job.get("completed_at"))
+        # A re-run's attempt lists the jobs it did not re-run, carried over
+        # from the earlier attempt: their created_at is the new attempt's,
+        # after they started. They are flagged and their queue wait and steps
+        # dropped, so they are not counted twice.
+        carried = created is not None and started is not None and started + 1 < created
         steps = []
         for step in job.get("steps") or []:
             if not isinstance(step, dict):
@@ -165,10 +170,11 @@ def _github(env: dict[str, str], token: str, deadline: Deadline) -> tuple[dict[s
                 "labels": sorted(str(x) for x in job.get("labels") or []),
                 # GitHub's job created_at is when the job became queued
                 # (its `needs` satisfied), so this is pure runner wait.
-                "queue_wait_seconds": _span(created, started),
+                "queue_wait_seconds": None if carried else _span(created, started),
                 "queue_basis": "job_created",
                 "duration_seconds": _span(started, completed),
-                "steps": steps,
+                "steps": [] if carried else steps,
+                "carried_over": carried,
                 "self": bool(runner) and job.get("runner_name") == runner and job.get("status") == "in_progress",
                 "url": job.get("html_url"),
             }
@@ -176,14 +182,20 @@ def _github(env: dict[str, str], token: str, deadline: Deadline) -> tuple[dict[s
     # On a push (a merge to the default branch), the PR that commit merged:
     # the join key for escapes (a main failure the PR run did not catch).
     merged_pr = None
+    warnings: list[str] = []
     if run.get("event") == "push" and run.get("head_sha"):
         sha = urllib.parse.quote(str(run["head_sha"]), safe="")
         api_repo = urllib.parse.quote(repo, safe="/")
-        status, pulls, _ = request("GET", f"{api}/repos/{api_repo}/commits/{sha}/pulls", headers=headers, deadline=deadline)
+        status, pulls, error = request("GET", f"{api}/repos/{api_repo}/commits/{sha}/pulls", headers=headers, deadline=deadline)
         if status == 200 and isinstance(pulls, list):
             merged = [p for p in pulls if isinstance(p, dict) and p.get("merged_at") and isinstance(p.get("number"), int)]
             if merged:
                 merged_pr = merged[0]["number"]
+        else:
+            # Without it a merge run cannot be joined to its PR (escapes).
+            warnings.append(
+                f"github: merged-PR lookup failed ({error or status}); the job needs `pull-requests: read`"
+            )
     return (
         {
             "platform": "github",
@@ -201,6 +213,7 @@ def _github(env: dict[str, str], token: str, deadline: Deadline) -> tuple[dict[s
                 "url": run.get("html_url"),
             },
             "jobs": jobs,
+            "warnings": warnings,
         },
         f"github: {len(jobs)} job(s)",
     )
@@ -227,12 +240,17 @@ def _forgejo(env: dict[str, str], token: str, deadline: Deadline) -> tuple[dict[
     base = f"{api}/repos/{urllib.parse.quote(repo, safe='/')}/actions"
 
     run_created = None
-    status, body, _ = request("GET", f"{base}/runs?limit=50", headers=headers, deadline=deadline)
-    if status == 200 and isinstance(body, dict):
-        for run in body.get("workflow_runs") or []:
-            if isinstance(run, dict) and str(run.get("index_in_repo")) == number:
-                run_created = _ts(run.get("created") or run.get("created_at"))
-                break
+    for page in range(1, MAX_PAGES + 1):
+        status, body, _ = request("GET", f"{base}/runs?limit=50&page={page}", headers=headers, deadline=deadline)
+        if status != 200 or not isinstance(body, dict):
+            break
+        runs = [r for r in body.get("workflow_runs") or [] if isinstance(r, dict)]
+        hit = next((r for r in runs if str(r.get("index_in_repo")) == number), None)
+        if hit is not None:
+            run_created = _ts(hit.get("created") or hit.get("created_at"))
+            break
+        if len(runs) < 50:
+            break
 
     tasks: list[dict[str, Any]] = []
     for page in range(1, MAX_PAGES + 1):
@@ -268,6 +286,7 @@ def _forgejo(env: dict[str, str], token: str, deadline: Deadline) -> tuple[dict[
                 "queue_basis": "run_created",
                 "duration_seconds": _span(started, completed),
                 "steps": [],
+                "carried_over": False,
                 "self": False,
                 "url": task.get("url"),
             }
@@ -289,6 +308,7 @@ def _forgejo(env: dict[str, str], token: str, deadline: Deadline) -> tuple[dict[
                 "url": None,
             },
             "jobs": jobs,
+            "warnings": [],
         },
         f"forgejo: {len(jobs)} task(s)",
     )

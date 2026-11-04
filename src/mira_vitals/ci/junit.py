@@ -145,6 +145,36 @@ def summarize(cases: list[dict[str, Any]], *, top: int = 20) -> dict[str, Any]:
 
 
 def test_id(case: dict[str, Any]) -> str:
-    """A stable identity for trend and flake queries across runs."""
-    parts = [p for p in (case.get("file") or case.get("classname"), case.get("name")) if p]
-    return "::".join(parts)
+    """The test's pytest node id, ``path/to/test_x.py::Class::test_name``.
+
+    A stable identity for trend, flake and escape queries, and the form a
+    quarantine list names tests in. pytest's default JUnit family (xunit2)
+    writes no ``file`` attribute, only a dotted ``classname`` such as
+    ``tests.test_x.TestThing``; the module path is the dotted prefix before
+    the first segment that names a class (``Test...``), the rest is the class
+    chain. With ``file`` present (xunit1) it is used as is.
+    """
+    name = case.get("name") or ""
+    classname = case.get("classname") or ""
+    path = (case.get("file") or "").replace("\\", "/")
+    segments = [s for s in classname.split(".") if s]
+    classes: list[str] = []
+    if path:
+        module_segments = path[:-3].replace("/", ".").split(".") if path.endswith(".py") else []
+        if module_segments and segments[: len(module_segments)] == module_segments:
+            classes = segments[len(module_segments):]
+    else:
+        split = next((i for i, s in enumerate(segments) if s[:1].isupper()), len(segments))
+        module, classes = segments[:split], segments[split:]
+        path = "/".join(module) + ".py" if module else ""
+    return "::".join(p for p in (path, *classes, name) if p)
+
+
+def normalize_id(value: str) -> str:
+    """A quarantine-list id in the same form as :func:`test_id`."""
+    value = value.strip().replace("\\", "/")
+    head, sep, tail = value.partition("::")
+    if not sep or "/" in head or head.endswith(".py"):
+        return value  # already a node id (or not a test id at all)
+    # A dotted classname form ("tests.test_x.TestT::test_y") is converted.
+    return test_id({"classname": head, "name": tail})

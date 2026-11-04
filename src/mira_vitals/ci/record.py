@@ -46,6 +46,7 @@ def build(
     generated_by: dict[str, Any],
     optimizations: dict[str, Any] | None = None,
     now: float | None = None,
+    max_cases: int | None = None,
 ) -> dict[str, Any]:
     now = time.time() if now is None else now
     self_job = None
@@ -63,6 +64,13 @@ def build(
         if selves:
             self_job = selves[0]
             self_job["self"] = True
+            # The report is the job's last step, so its own row would stay
+            # "in progress" for ever: this is its final snapshot. Completion
+            # is the report time, flagged by its basis.
+            if self_job.get("completed_at") is None and self_job.get("started_at"):
+                self_job["completed_at"] = now
+                self_job["duration_seconds"] = round(max(0.0, now - self_job["started_at"]), 3)
+                self_job["completed_basis"] = "report"
 
     started = (self_job or {}).get("started_at")
     if started:
@@ -86,6 +94,12 @@ def build(
     }
 
     tests_summary = junit_module.summarize(tests) if test_files else None
+    # The document keeps every failure and then the slowest tests, up to the
+    # cap; the summary above is over all of them. `dropped` says how many
+    # passing tests were left out, so a consumer never mistakes the cap for
+    # "did not run" (the escape view depends on that).
+    ordered = _cap_order(tests)
+    kept = ordered if max_cases is None else ordered[: max(0, max_cases)]
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_by": generated_by,
@@ -95,7 +109,7 @@ def build(
         "phases": phases,
         "caches": caches,
         "runner": runner,
-        "tests": {"files": test_files, "summary": tests_summary, "cases": tests},
+        "tests": {"files": test_files, "summary": tests_summary, "cases": kept, "dropped": len(ordered) - len(kept)},
         "optimizations": optimizations or {"selection": None, "parallelism": None},
         "platform": platform,
         "platform_note": platform_note,
@@ -216,10 +230,12 @@ def _identity_attrs(doc: dict[str, Any]) -> dict[str, Any]:
         "vcs.ref.head.name": ident.get("ref"),
         "cicd.pipeline.trigger": ident.get("event"),
         "ci.reporter.job": doc["job"].get("name"),
+        "ci.reporter.job.id": doc["job"].get("id"),
         "ci.selection.mode": ((doc.get("optimizations") or {}).get("selection") or {}).get("mode"),
         "vcs.change.id": ident.get("pr_number"),
         "vcs.ref.base.revision": ident.get("base_sha"),
         "ci.merged_change.id": ident.get("merged_pr_number"),
+        "ci.trigger.at": ident.get("trigger_at"),
     }
 
 
@@ -275,6 +291,8 @@ def log_records(doc: dict[str, Any], *, max_tests: int) -> list[dict[str, Any]]:
                 "cicd.worker.name": pjob.get("runner_name"),
                 "cicd.worker.labels": pjob.get("labels") or None,
                 "ci.job.self": bool(pjob.get("self")),
+                "ci.job.carried_over": bool(pjob.get("carried_over")),
+                "ci.job.completed.basis": pjob.get("completed_basis") or ("platform" if pjob.get("completed_at") else None),
                 "ci.run.created_at": run.get("created_at"),
                 "ci.run.started_at": run.get("started_at"),
                 "url.full": pjob.get("url"),
@@ -312,11 +330,7 @@ def log_records(doc: dict[str, Any], *, max_tests: int) -> list[dict[str, Any]]:
         )
 
     cases = (doc["tests"] or {}).get("cases") or []
-    # Failures first (flake detection needs every one), then slowest first,
-    # so a cap drops the fastest passing tests, never a failure.
-    ordered = sorted(
-        cases, key=lambda c: (c["outcome"] not in ("failed", "error"), -c["duration_seconds"])
-    )
+    ordered = _cap_order(cases)
     for case in ordered[:max_tests]:
         add(
             "ci.test",
@@ -332,9 +346,16 @@ def log_records(doc: dict[str, Any], *, max_tests: int) -> list[dict[str, Any]]:
                 "test.case.quarantined": case.get("quarantined"),
             },
         )
-    if len(ordered) > max_tests:
-        records[0]["attributes"]["ci.tests.dropped"] = len(ordered) - max_tests
+    dropped = max(0, len(ordered) - max_tests) + int((doc["tests"] or {}).get("dropped") or 0)
+    if dropped:
+        records[0]["attributes"]["ci.tests.dropped"] = dropped
     return records
+
+
+def _cap_order(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Failures first (flake and escape detection need every one), then the
+    slowest, so any cap drops the fastest passing tests, never a failure."""
+    return sorted(cases, key=lambda c: (c["outcome"] not in ("failed", "error"), -c["duration_seconds"]))
 
 
 def otlp_metrics_body(doc: dict[str, Any], now_ns: int) -> dict[str, Any]:

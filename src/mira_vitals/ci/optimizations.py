@@ -173,7 +173,10 @@ def workers(path: str | None, declared: int | None, warnings: list[str]) -> dict
         # max/mean: 1.0 is perfectly balanced; 2.0 means one worker took
         # twice the average and the rest waited for it.
         "imbalance": round(max(walls) / mean, 4) if walls and mean else None,
-        "db_isolated": isolation.pop() if len(isolation) == 1 else (None if not isolation else "mixed"),
+        # A string, so the column has one type: "true" | "false" | "mixed".
+        "db_isolated": (
+            ("true" if isolation.pop() else "false") if len(isolation) == 1 else ("mixed" if isolation else None)
+        ),
     }
 
 
@@ -185,7 +188,9 @@ def quarantine(path: str | None, warnings: list[str]) -> set[str]:
     if not isinstance(ids, list):
         warnings.append("quarantine file has no test_ids list; ignored")
         return set()
-    return {i for i in ids if isinstance(i, str)}
+    from .junit import normalize_id
+
+    return {normalize_id(i) for i in ids if isinstance(i, str) and i.strip()}
 
 
 def default_path(env: dict[str, str], name: str) -> str:
@@ -194,7 +199,7 @@ def default_path(env: dict[str, str], name: str) -> str:
 
 def pr_linkage(env: dict[str, str]) -> dict[str, Any]:
     """The PR a run belongs to, from the ref or the event payload."""
-    out: dict[str, Any] = {"pr_number": None, "base_sha": None, "head_sha": None}
+    out: dict[str, Any] = {"pr_number": None, "base_sha": None, "head_sha": None, "trigger_at": None}
     ref = env.get("GITHUB_REF") or ""
     match = re.match(r"^refs/pull/(\d+)/", ref)
     if match:
@@ -205,6 +210,13 @@ def pr_linkage(env: dict[str, str]) -> dict[str, Any]:
             if os.path.getsize(event_path) <= MAX_FILE_BYTES:
                 with open(event_path, encoding="utf-8") as handle:
                     event = json.load(handle)
+                # The trigger time for feedback latency: a push's own time
+                # (repository.pushed_at, epoch seconds). Other events fall
+                # back to the run's creation in the store.
+                repo_info = event.get("repository") if isinstance(event, dict) else None
+                pushed = repo_info.get("pushed_at") if isinstance(repo_info, dict) else None
+                if isinstance(pushed, (int, float)) and not isinstance(pushed, bool) and "pusher" in event:
+                    out["trigger_at"] = float(pushed)
                 pr = event.get("pull_request") if isinstance(event, dict) else None
                 if isinstance(pr, dict):
                     if isinstance(pr.get("number"), int):

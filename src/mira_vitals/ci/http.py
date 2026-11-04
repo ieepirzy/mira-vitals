@@ -19,6 +19,20 @@ from typing import Any
 USER_AGENT = "mira-vitals-ci"
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect. urllib's default handler follows them and
+    copies the Authorization header to the new location -- any host, even
+    plain http. Nothing this command calls needs a redirect, so a 3xx is
+    returned as the answer instead of being followed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+#: The one opener every request goes through (OTLP export and adapters).
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 class Deadline:
     """A wall-clock budget shared by every request in one report."""
 
@@ -74,7 +88,7 @@ def request(
     headers.setdefault("Accept", "application/json")
     req = urllib.request.Request(url, data=data, method=method, headers=headers)  # noqa: S310 - https or loopback only (above)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
+        with _OPENER.open(req, timeout=timeout) as response:  # noqa: S310 - https or loopback only
             raw = response.read(32 * 1024 * 1024)
             status = response.status
     except urllib.error.HTTPError as exc:

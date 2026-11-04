@@ -528,7 +528,7 @@ def test_worker_imbalance_and_isolation(tmp_path):
     ]}))
     got = optimizations.workers(str(path), None, [])
     assert got["count"] == 2 and got["wall_max_seconds"] == 300 and got["imbalance"] == 1.5
-    assert got["db_isolated"] is True
+    assert got["db_isolated"] == "true"
     assert optimizations.workers(None, 8, [])["count"] == 8
     assert optimizations.workers(None, None, []) is None
 
@@ -539,7 +539,7 @@ def test_pr_linkage_from_ref_and_event(tmp_path):
     event = tmp_path / "event.json"
     event.write_text(json.dumps({"pull_request": {"number": 148, "base": {"sha": "b" * 40}, "head": {"sha": "h" * 40}}}))
     got = optimizations.pr_linkage({"GITHUB_REF": "refs/pull/148/merge", "GITHUB_EVENT_PATH": str(event)})
-    assert got == {"pr_number": 148, "base_sha": "b" * 40, "head_sha": "h" * 40}
+    assert got == {"pr_number": 148, "base_sha": "b" * 40, "head_sha": "h" * 40, "trigger_at": None}
     assert optimizations.pr_linkage({"GITHUB_REF": "refs/heads/main"})["pr_number"] is None
 
 
@@ -612,3 +612,258 @@ def test_runs_from_a_bare_checkout_with_pythonpath_only(tmp_path):
     assert doc["generated_by"]["revision"] == "deadbeef"
     assert doc["generated_by"]["source"] == "action-checkout"
     assert doc["job"]["wall_basis"] == "marks"
+
+
+# --- review round: hardening ------------------------------------------------
+
+
+def _action_wrapper(tmp_path, python_path):
+    """Run the action's own install step (from action.yml) to build the
+    wrapper, exactly as the runner would."""
+    import os
+    import re
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, ".github", "actions", "ci-health", "action.yml"), encoding="utf-8") as handle:
+        manifest = handle.read()
+    blocks = re.findall(r"      run: \|\n((?:        .*\n|\n)+)", manifest)
+    install = next(b for b in blocks if "printf" in b)
+    script = tmp_path / "install.sh"
+    script.write_text("\n".join(line[8:] for line in install.splitlines()) + "\n")
+    state = tmp_path / "state"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "MV_DIR": str(state),
+        "MV_PY": python_path,
+        "MV_READY": "",
+        "MV_SRC": os.path.join(root, "src"),
+        "GITHUB_PATH": str(tmp_path / "github_path"),
+    }
+    subprocess.run(["bash", str(script)], env=env, check=True, timeout=60, capture_output=True)
+    return state / "bin" / "mira-vitals"
+
+
+def test_action_wrapper_ignores_a_shadowing_module_in_the_workspace(tmp_path):
+    """M1: the report runs in the checked-out repository with tokens in its
+    environment. A repo-root json.py must not be imported instead of the
+    standard library's."""
+    import os
+    import subprocess
+    import sys
+
+    wrapper = _action_wrapper(tmp_path, sys.executable)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    marker = tmp_path / "pwned"
+    (workspace / "json.py").write_text(f"open({str(marker)!r}, 'w').write('x')\nraise SystemExit(99)\n")
+    env = {"PATH": os.environ.get("PATH", ""), "MIRA_VITALS_CI_DIR": str(tmp_path / "s"), "GITHUB_TOKEN": "t"}
+    result = subprocess.run(
+        [str(wrapper), "ci", "report", "--no-export", "--quiet", "--output", "doc.json"],
+        cwd=workspace, env=env, capture_output=True, text=True, timeout=120, check=False,
+    )
+    assert not marker.exists(), "the workspace json.py was imported"
+    assert result.returncode == 0, result.stderr
+    assert json.loads((workspace / "doc.json").read_text())["schema_version"] == "ci-health/1"
+
+
+def test_action_runs_nothing_unbounded():
+    """M3: no step downloads anything, and the wrapper runs under timeout."""
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, ".github", "actions", "ci-health", "action.yml"), encoding="utf-8") as handle:
+        manifest = handle.read()
+    code = "\n".join(line for line in manifest.splitlines() if not line.strip().startswith("#"))
+    assert "uses:" not in code  # no setup-uv or any other download step
+    assert "uv python install" not in code
+    assert "exec timeout 120 %q -P -m mira_vitals" in code
+    assert "timeout 20 uv python find" in code
+
+
+def test_a_redirect_is_refused_and_the_token_never_follows_it():
+    """M2: urllib's default handler follows a 302 and copies Authorization
+    to the new host; here a redirect is an answer, not followed."""
+    from mira_vitals.ci.http import request
+
+    other = _Api({"/": (200, {"stolen": True})})
+    first = _Api({})
+    first.routes = {}
+    # A route that redirects to the other server.
+
+    class Redirect(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            first.seen.append(("GET", self.path, dict(self.headers), b""))
+            self.send_response(302)
+            self.send_header("Location", other.url + "/collect")
+            self.end_headers()
+
+        do_POST = do_GET
+
+    first.close()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/start"
+    try:
+        status, body, error = request("GET", url, headers={"Authorization": "Bearer secret-token"}, deadline=Deadline(10))
+        status_post, _, _ = request("POST", url, headers={"Authorization": "Bearer secret-token"}, body={"a": 1},
+                                    deadline=Deadline(10))
+    finally:
+        server.shutdown()
+        other.close()
+    assert status == 302 and status_post == 302
+    assert other.seen == [], "the redirect was followed"
+
+
+def test_untrusted_names_cannot_inject_workflow_commands(env, tmp_path, capsys):
+    """M7: a test or step name with a newline must not start a stdout line
+    (the runner reads `::command::` there) or break the summary table."""
+    junit_path = tmp_path / "junit.xml"
+    junit_path.write_text(
+        '<testsuite><testcase classname="tests.test_a" name="evil&#10;::error::pwned|`x`" time="9"/>'
+        '<testcase classname="tests.test_a" name="ok&#13;&#10;::add-mask::x" time="1"/></testsuite>'
+    )
+    jobs = json.loads(json.dumps(GH_JOBS))
+    jobs["jobs"][0]["steps"][1]["name"] = "Test\n::error::from-step"
+    api = _Api({"/repos/o/r/actions/runs/7/attempts/1/jobs": (200, jobs), "/repos/o/r/actions/runs/7": (200, GH_RUN)})
+    summary = tmp_path / "summary.md"
+    try:
+        command.main(
+            ["report", "--junit", str(junit_path), "--no-export", "--output", str(tmp_path / "d.json")],
+            env=_gh_env(env, api, GITHUB_STEP_SUMMARY=str(summary)),
+        )
+    finally:
+        api.close()
+    out = capsys.readouterr().out
+    for text in (out, summary.read_text()):
+        for line in text.splitlines():
+            assert not line.lstrip().startswith("::error") and not line.lstrip().startswith("::add-mask"), line
+    # The pipe is escaped for the table, the backticks neutralised.
+    assert "evil ::error::pwned\\|'x'" in summary.read_text()
+
+
+def test_the_whole_command_has_a_wall_clock_deadline(env, monkeypatch, capsys):
+    """M3: not only per-request timeouts -- a stuck report is stopped."""
+    import time as time_module
+
+    monkeypatch.setattr(command, "_deadline_seconds", lambda budget: 0.3)
+
+    def slow(*a, **k):
+        time_module.sleep(3)
+
+    monkeypatch.setattr(command, "_report", slow)
+    started = time_module.monotonic()
+    assert command.main(["report"], env=env) == 0
+    assert time_module.monotonic() - started < 2
+    assert "budget" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "case,want",
+    [
+        ({"classname": "tests.test_a", "name": "test_x"}, "tests/test_a.py::test_x"),
+        ({"classname": "tests.unit.test_a.TestThing", "name": "test_x[1-2]"}, "tests/unit/test_a.py::TestThing::test_x[1-2]"),
+        ({"classname": "tests.test_a", "name": "test_x", "file": "tests/test_a.py"}, "tests/test_a.py::test_x"),
+        ({"classname": "tests.test_a.TestT", "name": "test_x", "file": "tests/test_a.py"}, "tests/test_a.py::TestT::test_x"),
+    ],
+)
+def test_test_ids_are_pytest_node_ids(case, want):
+    """M9: xunit2 (pytest's default) has no file attribute; ids still match
+    the node ids a quarantine list uses."""
+    assert junit.test_id(case) == want
+
+
+def test_quarantine_ids_normalize_to_node_ids(tmp_path):
+    from mira_vitals.ci import optimizations
+
+    path = tmp_path / "q.json"
+    path.write_text(json.dumps({"test_ids": ["tests/test_a.py::test_x", "tests.test_b::test_y", "  "]}))
+    assert optimizations.quarantine(str(path), []) == {"tests/test_a.py::test_x", "tests/test_b.py::test_y"}
+
+
+def test_jobs_carried_over_from_an_earlier_attempt_are_flagged(env):
+    """M4: a re-run's attempt lists jobs it did not re-run; their created_at
+    is after they started, and they must not count twice."""
+    jobs = json.loads(json.dumps(GH_JOBS))
+    jobs["jobs"][1]["created_at"] = "2026-11-03T15:30:00Z"  # attempt 2 created after compose ran
+    api = _Api({"/repos/o/r/actions/runs/7/attempts/1/jobs": (200, jobs), "/repos/o/r/actions/runs/7": (200, GH_RUN)})
+    try:
+        got, _ = platforms.fetch(_gh_env(env, api), Deadline(10))
+    finally:
+        api.close()
+    compose = next(j for j in got["jobs"] if j["name"] == "compose")
+    assert compose["carried_over"] is True and compose["queue_wait_seconds"] is None and compose["steps"] == []
+    test = next(j for j in got["jobs"] if j["name"] == "test")
+    assert test["carried_over"] is False
+
+
+def test_the_reporting_job_closes_its_own_row(env, tmp_path):
+    """M5: the last job of a run reports while in progress; its ci.job row
+    still gets a completion (the report time) and a duration."""
+    api = _Api({"/repos/o/r/actions/runs/7/attempts/1/jobs": (200, GH_JOBS), "/repos/o/r/actions/runs/7": (200, GH_RUN)})
+    out = tmp_path / "d.json"
+    try:
+        command.main(["report", "--no-export", "--quiet", "--output", str(out)], env=_gh_env(env, api))
+    finally:
+        api.close()
+    doc = json.loads(out.read_text())
+    me = next(j for j in doc["platform"]["jobs"] if j["self"])
+    assert me["completed_at"] is not None and me["completed_basis"] == "report"
+    assert me["duration_seconds"] == pytest.approx(doc["job"]["wall_seconds"], abs=1)
+    row = next(r for r in record.log_records(doc, max_tests=0) if r["event"] == "ci.job" and r["attributes"]["ci.job.self"])
+    assert row["attributes"]["ci.job.completed.basis"] == "report"
+    assert row["attributes"]["ci.reporter.job.id"] == 11
+
+
+def test_a_refused_merged_pr_lookup_is_a_warning(env, tmp_path, capsys):
+    """M8: commits/{sha}/pulls needs pull-requests: read; a 403 says so."""
+    run = dict(GH_RUN, event="push")
+    api = _Api({
+        "/repos/o/r/actions/runs/7/attempts/1/jobs": (200, GH_JOBS),
+        "/repos/o/r/actions/runs/7": (200, run),
+        "/repos/o/r/commits/": (403, {"message": "Resource not accessible by integration"}),
+    })
+    try:
+        command.main(["report", "--no-export", "--output", str(tmp_path / "d.json")], env=_gh_env(env, api))
+    finally:
+        api.close()
+    assert "pull-requests: read" in capsys.readouterr().out
+
+
+def test_schema_views_use_no_throwing_conversions():
+    """H1: a materialized view that throws fails the INSERT into the shared
+    otel_logs table and drops other services' logs. The documented views are
+    validated on ClickHouse against a hostile batch (64-char SHAs, garbage
+    numbers and JSON); this guards the known throwing forms statically."""
+    import os
+    import re
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "docs", "ci-health.md"), encoding="utf-8") as handle:
+        sql = "\n".join(re.findall(r"```sql\n(.*?)```", handle.read(), re.S))
+    assert "FixedString" not in sql
+    views = [b for b in re.split(r";\s*\n", sql) if "MATERIALIZED VIEW" in b]
+    assert len(views) >= 5
+    for view in views:
+        # Plain conversions throw on bad input; only the total forms are
+        # allowed -- except an integer cast of a boolean, which cannot.
+        for match in re.finditer(r"\bto(?:U?Int\d+|Float\d+|Date(?:Time)?(?:64)?|Decimal\d*)\(([^()]*)\)", view):
+            argument = match.group(1)
+            if match.group(0).startswith("toUInt") and re.search(r"(=|\bIN\b)", argument):
+                continue
+            raise AssertionError(f"throwing conversion {match.group(0)} in a materialized view")
+        assert "JSONExtractRaw(" not in view
+
+
+def test_push_trigger_time_from_the_event(tmp_path):
+    """Feedback latency starts at the push: repository.pushed_at."""
+    from mira_vitals.ci import optimizations
+
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"pusher": {"name": "x"}, "repository": {"pushed_at": 1762200000}}))
+    assert optimizations.pr_linkage({"GITHUB_EVENT_PATH": str(event)})["trigger_at"] == 1762200000.0
+    event.write_text(json.dumps({"pull_request": {"number": 1}, "repository": {"pushed_at": "2026-01-01T00:00:00Z"}}))
+    assert optimizations.pr_linkage({"GITHUB_EVENT_PATH": str(event)})["trigger_at"] is None

@@ -59,7 +59,7 @@ optimization, and its safety, and not only the timings:
 | Parallelism: xdist worker count, per-worker wall time, imbalance (max/mean), per-worker DB isolation | `workers.json` or `--workers N` | |
 | Caches: uv/npm, docker layers, test-result cache | `--cache name=hit` | Any name; one map. |
 | Flakiness: failed and passed on the same commit, first and last seen, quarantine status | derived (`ci.flaky_tests`); quarantine from `quarantine.json` | |
-| PR linkage: the PR a run belongs to, its base sha, and on the default branch the PR a commit merged | event payload; GitHub adapter (`commits/{sha}/pulls`) | The join keys for escapes and per-PR cost. |
+| PR linkage: the PR a run belongs to, its base sha, and on the default branch the PR a commit merged | event payload; GitHub adapter (`commits/{sha}/pulls`) | The join keys for escapes and per-PR cost. The merged-PR lookup needs `pull-requests: read` on the default-branch job; without it the report warns and escapes cannot be joined. |
 | Outcome safety: red main after a green PR, reverts, rollbacks after deploy | `ci.outcomes` (reserved), `ci.red_main_after_green_pr` (derived now) | Producers for reverts and rollbacks come later. |
 
 File contracts (all optional, in the job's state directory or passed with
@@ -131,42 +131,63 @@ directly uses the same column names.
 ```sql
 CREATE DATABASE IF NOT EXISTS ci;
 
--- One row per job per run attempt; the newest report wins.
+-- Every expression in the materialized views below is TOTAL: whatever a
+-- producer sends, the view yields a value or NULL and never throws. A view
+-- that throws fails the INSERT into the shared otel_logs table and drops
+-- every other service's logs in that batch. So: SHAs are String (a Forgejo
+-- SHA-256 is 64 characters), numbers use the *OrZero/*OrNull parsers, JSON
+-- uses typed JSONExtract (a default on a mismatch), and epoch seconds go
+-- through ciHealthTs, which clamps before converting.
+CREATE FUNCTION IF NOT EXISTS ciHealthTs AS (s) ->
+    if(isFinite(ifNull(toFloat64OrNull(s), nan)) AND toFloat64OrNull(s) BETWEEN 0 AND 4102444800,
+       toDateTime64(least(greatest(if(isFinite(ifNull(toFloat64OrNull(s), nan)), ifNull(toFloat64OrNull(s), 0), 0), 0), 4102444800), 3, 'UTC'),
+       NULL);
+
+-- One row per job per run attempt; the newest report wins. Every later job
+-- of a run reports the earlier ones again, and the reporting job reports
+-- itself with its completion set to the report time (completed_basis
+-- 'report'), so the last job of a run has a finished row too.
 CREATE TABLE ci.jobs
 (
-    repository     LowCardinality(String),
-    workflow       LowCardinality(String),
-    run_id         UInt64,
-    run_attempt    UInt16,
-    run_number     UInt64,
-    sha            FixedString(40),
-    ref            String,
-    event          LowCardinality(String),
-    job_id         UInt64,
-    job_name       LowCardinality(String),
-    status         LowCardinality(String),
-    conclusion     LowCardinality(Nullable(String)),
-    run_created_at Nullable(DateTime64(3, 'UTC')),
-    created_at     Nullable(DateTime64(3, 'UTC')),
-    started_at     Nullable(DateTime64(3, 'UTC')),
-    completed_at   Nullable(DateTime64(3, 'UTC')),
-    queue_wait_s   Nullable(Float64),
-    queue_basis    LowCardinality(String),
-    duration_s     Nullable(Float64),
-    runner_name    String,
-    labels         Array(LowCardinality(String)),
-    reported_at    DateTime64(3, 'UTC')
+    repository      LowCardinality(String),
+    workflow        LowCardinality(String),
+    run_id          UInt64,
+    run_attempt     UInt32,
+    run_number      UInt64,
+    sha             String,
+    ref             String,
+    event           LowCardinality(String),
+    job_id          UInt64,
+    job_name        LowCardinality(String),
+    status          LowCardinality(String),
+    conclusion      LowCardinality(Nullable(String)),
+    carried_over    UInt8,   -- listed by a re-run attempt but run in an earlier one
+    trigger_at      Nullable(DateTime64(3, 'UTC')),   -- the push, when known (feedback latency)
+    run_created_at  Nullable(DateTime64(3, 'UTC')),
+    created_at      Nullable(DateTime64(3, 'UTC')),
+    started_at      Nullable(DateTime64(3, 'UTC')),
+    completed_at    Nullable(DateTime64(3, 'UTC')),
+    completed_basis LowCardinality(Nullable(String)),   -- 'platform' | 'report'
+    queue_wait_s    Nullable(Float64),
+    queue_basis     LowCardinality(String),
+    duration_s      Nullable(Float64),
+    runner_name     String,
+    labels          Array(LowCardinality(String)),
+    reported_at     DateTime64(3, 'UTC')
 )
 ENGINE = ReplacingMergeTree(reported_at)
-PARTITION BY toYYYYMM(reported_at)
-ORDER BY (repository, run_id, run_attempt, job_id);
+-- By the job's own time, which every report of it repeats, so all its
+-- versions land in one partition and replace each other.
+PARTITION BY toYYYYMM(ifNull(run_created_at, reported_at))
+ORDER BY (repository, run_id, run_attempt, job_id)
+TTL toDateTime(reported_at) + INTERVAL 400 DAY;
 
 CREATE TABLE ci.steps
 (
     repository   LowCardinality(String),
     workflow     LowCardinality(String),
     run_id       UInt64,
-    run_attempt  UInt16,
+    run_attempt  UInt32,
     job_id       UInt64,
     job_name     LowCardinality(String),
     step_number  UInt16,
@@ -179,22 +200,24 @@ CREATE TABLE ci.steps
 )
 ENGINE = ReplacingMergeTree(reported_at)
 PARTITION BY toYYYYMM(started_at)
-ORDER BY (repository, run_id, run_attempt, job_id, step_number);
+ORDER BY (repository, run_id, run_attempt, job_id, step_number)
+TTL toDateTime(started_at) + INTERVAL 400 DAY;
 
 CREATE TABLE ci.tests
 (
     repository  LowCardinality(String),
     workflow    LowCardinality(String),
     job_name    LowCardinality(String),
+    job_id      UInt64,             -- matrix legs share a job name, not an id
     run_id      UInt64,
-    run_attempt UInt16,
-    sha         FixedString(40),
+    run_attempt UInt32,
+    sha         String,
     ref         String,
     event       LowCardinality(String),
     pr_number   Nullable(UInt32),   -- the PR this run belongs to (PR runs)
     merged_pr   Nullable(UInt32),   -- the PR this commit merged (default-branch runs)
     selection_mode LowCardinality(Nullable(String)),  -- 'full' | 'selected' | NULL (no selector)
-    test_id     String,
+    test_id     String,             -- pytest node id
     suite       String,
     outcome     LowCardinality(String),
     duration_s  Float64,
@@ -203,7 +226,7 @@ CREATE TABLE ci.tests
 )
 ENGINE = ReplacingMergeTree(ts)
 PARTITION BY toYYYYMM(ts)
-ORDER BY (repository, test_id, run_id, run_attempt)
+ORDER BY (repository, test_id, run_id, run_attempt, job_name, job_id)
 TTL toDateTime(ts) + INTERVAL 180 DAY;
 
 CREATE TABLE ci.reports
@@ -211,9 +234,10 @@ CREATE TABLE ci.reports
     repository        LowCardinality(String),
     workflow          LowCardinality(String),
     job_name          LowCardinality(String),
+    job_id            UInt64,
     run_id            UInt64,
-    run_attempt       UInt16,
-    sha               FixedString(40),
+    run_attempt       UInt32,
+    sha               String,
     outcome           LowCardinality(Nullable(String)),
     wall_s            Nullable(Float64),
     queue_wait_s      Nullable(Float64),
@@ -226,12 +250,13 @@ CREATE TABLE ci.reports
     tests_count       Nullable(UInt32),
     tests_total_s     Nullable(Float64),
     tests_for_80pct   Nullable(UInt32),
+    tests_dropped     UInt32,   -- passing tests left out of ci.tests by the cap
 
     -- PR linkage: the join keys for escapes and per-PR cost.
     event             LowCardinality(String),
     ref               String,
     pr_number         Nullable(UInt32),
-    base_sha          Nullable(FixedString(40)),
+    base_sha          Nullable(String),
     merged_pr         Nullable(UInt32),
 
     -- Test selection (mira-vitals ci select; NULL where no selector ran).
@@ -257,15 +282,17 @@ CREATE TABLE ci.reports
 )
 ENGINE = ReplacingMergeTree(ts)
 PARTITION BY toYYYYMM(ts)
-ORDER BY (repository, run_id, run_attempt, job_name);
+ORDER BY (repository, run_id, run_attempt, job_name, job_id)
+TTL toDateTime(ts) + INTERVAL 400 DAY;
 
 -- One row per xdist worker per job.
 CREATE TABLE ci.workers
 (
     repository  LowCardinality(String),
     run_id      UInt64,
-    run_attempt UInt16,
+    run_attempt UInt32,
     job_name    LowCardinality(String),
+    job_id      UInt64,
     worker      LowCardinality(String),
     wall_s      Nullable(Float64),
     tests       Nullable(UInt32),
@@ -274,7 +301,8 @@ CREATE TABLE ci.workers
 )
 ENGINE = ReplacingMergeTree(ts)
 PARTITION BY toYYYYMM(ts)
-ORDER BY (repository, run_id, run_attempt, job_name, worker);
+ORDER BY (repository, run_id, run_attempt, job_name, job_id, worker)
+TTL toDateTime(ts) + INTERVAL 400 DAY;
 
 -- Outcome safety. Reserved now, filled by later producers (a deploy
 -- controller for rollbacks, a commit scanner for reverts); the
@@ -283,9 +311,9 @@ CREATE TABLE ci.outcomes
 (
     repository  LowCardinality(String),
     kind        LowCardinality(String),   -- 'red_main_after_green_pr' | 'revert' | 'rollback'
-    sha         FixedString(40),          -- the commit that went bad / was reverted / rolled back
+    sha         String,                   -- the commit that went bad / was reverted / rolled back
     pr_number   Nullable(UInt32),
-    related_sha Nullable(FixedString(40)),   -- the revert commit, or the deploy it rolled back to
+    related_sha Nullable(String),         -- the revert commit, or the deploy it rolled back to
     environment LowCardinality(Nullable(String)),   -- rollbacks: which deployment
     source      LowCardinality(String),   -- who reported it
     detected_at DateTime64(3, 'UTC'),
@@ -293,7 +321,8 @@ CREATE TABLE ci.outcomes
 )
 ENGINE = ReplacingMergeTree(detected_at)
 PARTITION BY toYYYYMM(detected_at)
-ORDER BY (repository, kind, sha);
+ORDER BY (repository, kind, sha)
+TTL toDateTime(detected_at) + INTERVAL 1095 DAY;
 
 -- Flakiness: a test that failed and passed on the same commit. One row per
 -- (repository, test, commit) with outcome counts, kept by a view on ci.tests.
@@ -301,14 +330,15 @@ CREATE TABLE ci.test_commit_outcomes
 (
     repository LowCardinality(String),
     test_id    String,
-    sha        FixedString(40),
+    sha        String,
     fails      SimpleAggregateFunction(sum, UInt64),
     passes     SimpleAggregateFunction(sum, UInt64),
     first_ts   SimpleAggregateFunction(min, DateTime64(3, 'UTC')),
     last_ts    SimpleAggregateFunction(max, DateTime64(3, 'UTC'))
 )
 ENGINE = AggregatingMergeTree
-ORDER BY (repository, test_id, sha);
+ORDER BY (repository, test_id, sha)
+TTL toDateTime(last_ts) + INTERVAL 400 DAY;
 
 CREATE MATERIALIZED VIEW ci.test_commit_outcomes_mv TO ci.test_commit_outcomes AS
 SELECT repository, test_id, sha,
@@ -342,61 +372,169 @@ GROUP BY o.repository, o.test_id;
 
 -- Escapes, the safety metric for test selection: a test that failed on the
 -- default branch in a FULL run, for the commit that merged PR N, but did not
--- run at all in PR N's last run because that run was a SELECTION.
+-- run at all in PR N's last run of the SAME workflow because that run was a
+-- SELECTION. Not an escape, so excluded:
+--   * a quarantined failure;
+--   * a PR run whose report dropped tests for the cap (tests_dropped > 0):
+--     "not in ci.tests" would not mean "not run";
+--   * a test first seen after the PR's last run started (it did not exist
+--     on the PR's branch: added to the default branch later).
 CREATE VIEW ci.escapes AS
 WITH
     main_failures AS
     (
-        SELECT repository, merged_pr AS pr, sha AS merge_sha, test_id, min(ts) AS failed_at
+        SELECT repository, workflow, merged_pr AS pr, sha AS merge_sha, test_id, min(ts) AS failed_at
         FROM ci.tests FINAL
         WHERE merged_pr IS NOT NULL
           AND outcome IN ('failed', 'error')
           AND quarantined = 0
           AND (selection_mode = 'full' OR selection_mode IS NULL)
-        GROUP BY repository, pr, merge_sha, test_id
+        GROUP BY repository, workflow, pr, merge_sha, test_id
     ),
     pr_last_run AS
     (
-        SELECT repository, pr_number AS pr,
-               argMax(run_id, ts) AS last_run_id, argMax(selection_mode, ts) AS mode,
-               argMax(selector_version, ts) AS selector_version
+        SELECT repository, workflow, pr_number AS pr,
+               argMax(run_id, ts)           AS last_run_id,
+               argMax(selection_mode, ts)   AS mode,
+               argMax(selector_version, ts) AS selector_version,
+               argMax(tests_dropped, ts)    AS dropped,
+               max(ts)                      AS last_run_ts
         FROM ci.reports FINAL
         WHERE pr_number IS NOT NULL AND tests_count IS NOT NULL
-        GROUP BY repository, pr
+        GROUP BY repository, workflow, pr
     ),
     pr_ran AS
     (
-        SELECT DISTINCT t.repository AS repository, t.pr_number AS pr, t.test_id AS test_id
+        SELECT DISTINCT t.repository AS repository, t.workflow AS workflow, t.pr_number AS pr, t.test_id AS test_id
         FROM ci.tests AS t FINAL
         INNER JOIN pr_last_run AS l
-            ON l.repository = t.repository AND l.pr = t.pr_number AND l.last_run_id = t.run_id
+            ON l.repository = t.repository AND l.workflow = t.workflow
+           AND l.pr = t.pr_number AND l.last_run_id = t.run_id
+    ),
+    first_seen AS
+    (
+        SELECT repository, test_id, min(ts) AS first_ts
+        FROM ci.tests
+        GROUP BY repository, test_id
     )
-SELECT f.repository AS repository, f.pr AS pr, f.merge_sha AS merge_sha, f.test_id AS test_id,
-       f.failed_at AS failed_at, l.selector_version AS selector_version
+SELECT f.repository AS repository, f.workflow AS workflow, f.pr AS pr, f.merge_sha AS merge_sha,
+       f.test_id AS test_id, f.failed_at AS failed_at, l.selector_version AS selector_version
 FROM main_failures AS f
-INNER JOIN pr_last_run AS l ON l.repository = f.repository AND l.pr = f.pr
-LEFT ANTI JOIN pr_ran AS r ON r.repository = f.repository AND r.pr = f.pr AND r.test_id = f.test_id
-WHERE l.mode = 'selected';
+INNER JOIN pr_last_run AS l ON l.repository = f.repository AND l.workflow = f.workflow AND l.pr = f.pr
+INNER JOIN first_seen AS s ON s.repository = f.repository AND s.test_id = f.test_id
+LEFT ANTI JOIN pr_ran AS r
+    ON r.repository = f.repository AND r.workflow = f.workflow AND r.pr = f.pr AND r.test_id = f.test_id
+WHERE l.mode = 'selected' AND l.dropped = 0 AND s.first_ts <= l.last_run_ts;
 
 -- Red main after a green PR, derived until a producer writes ci.outcomes:
--- the merge commit's default-branch run failed, the PR's last run passed.
+-- any job of the merge commit's default-branch runs failed, while every job
+-- of the PR's last run passed.
 CREATE VIEW ci.red_main_after_green_pr AS
-SELECT m.repository AS repository, m.merged_pr AS pr, m.sha AS merge_sha, m.last_ts AS failed_at
+SELECT m.repository AS repository, m.merged_pr AS pr, m.sha AS merge_sha, m.first_failed AS failed_at
 FROM
 (
-    SELECT repository, merged_pr, sha, max(ts) AS last_ts, argMax(outcome, ts) AS last_outcome
+    SELECT repository, merged_pr, sha, minIf(ts, outcome = 'failure') AS first_failed
     FROM ci.reports FINAL
     WHERE merged_pr IS NOT NULL
     GROUP BY repository, merged_pr, sha
+    HAVING countIf(outcome = 'failure') > 0
 ) AS m
 INNER JOIN
 (
-    SELECT repository, pr_number, argMax(outcome, ts) AS last_outcome
+    SELECT repository, pr_number, argMax(run_id, ts) AS last_run_id
     FROM ci.reports FINAL
     WHERE pr_number IS NOT NULL
     GROUP BY repository, pr_number
-) AS p ON p.repository = m.repository AND p.pr_number = m.merged_pr
-WHERE m.last_outcome = 'failure' AND p.last_outcome = 'success';
+) AS l ON l.repository = m.repository AND l.pr_number = m.merged_pr
+INNER JOIN
+(
+    SELECT repository, pr_number, run_id, countIf(outcome = 'failure') AS failures
+    FROM ci.reports FINAL
+    WHERE pr_number IS NOT NULL
+    GROUP BY repository, pr_number, run_id
+) AS p ON p.repository = l.repository AND p.pr_number = l.pr_number AND p.run_id = l.last_run_id
+WHERE p.failures = 0;
+
+-- Feedback latency, the primary CI metric (Ilari 2026-11-05): how long a
+-- developer waits for an answer. Computed here, in the store, from ci.jobs:
+-- a reporter sees only its own run's jobs, never sibling workflows, so the
+-- per-SHA verdict can only be assembled after the fact.
+--
+--   time to verdict        trigger -> the last job concluded, queue included.
+--                          NULL while any job of the run (or SHA) has no
+--                          completion yet. Needs the ci-health report as the
+--                          last step of each workflow's last job: that job
+--                          closes its own row (completed_basis 'report').
+--   time to first failure  trigger -> the earliest failing job's completion,
+--                          on red runs only.
+--   trigger                the push time when the producer had it (push
+--                          events: repository.pushed_at), else the run's
+--                          creation.
+--   queue share            the union of every job's queue interval
+--                          (created -> started) over the time to verdict.
+--   idle share             the time no job was running at all (queue plus
+--                          hand-offs between dependent jobs) over the same.
+CREATE VIEW ci.run_verdicts AS
+SELECT
+    repository, workflow, run_id, run_attempt,
+    any(sha)                                                         AS sha,
+    any(event)                                                       AS event,
+    toUnixTimestamp64Milli(assumeNotNull(coalesce(min(trigger_at), min(run_created_at), min(created_at)))) / 1000 AS trigger_s,
+    countIf(completed_at IS NULL) = 0                                AS complete,
+    countIf(conclusion = 'failure') > 0                              AS red,
+    if(complete, toUnixTimestamp64Milli(assumeNotNull(max(completed_at))) / 1000 - trigger_s, NULL) AS time_to_verdict_s,
+    if(red, toUnixTimestamp64Milli(assumeNotNull(minIf(completed_at, conclusion = 'failure'))) / 1000 - trigger_s, NULL) AS time_to_first_failure_s,
+    arraySort(x -> x.1, groupArrayIf((toUnixTimestamp64Milli(assumeNotNull(started_at)) / 1000,
+                                      toUnixTimestamp64Milli(assumeNotNull(completed_at)) / 1000),
+                                     started_at IS NOT NULL AND completed_at IS NOT NULL)) AS run_spans,
+    arraySort(x -> x.1, groupArrayIf((toUnixTimestamp64Milli(assumeNotNull(created_at)) / 1000,
+                                      toUnixTimestamp64Milli(assumeNotNull(started_at)) / 1000),
+                                     created_at IS NOT NULL AND started_at IS NOT NULL AND carried_over = 0)) AS queue_spans,
+    -- The length of a union of intervals: fold over them sorted by start.
+    arrayFold((acc, x) -> if(x.1 > acc.3, (acc.1 + (acc.3 - acc.2), x.1, x.2), (acc.1, acc.2, greatest(acc.3, x.2))),
+              run_spans, (0., run_spans[1].1, run_spans[1].1))   AS run_fold,
+    arrayFold((acc, x) -> if(x.1 > acc.3, (acc.1 + (acc.3 - acc.2), x.1, x.2), (acc.1, acc.2, greatest(acc.3, x.2))),
+              queue_spans, (0., queue_spans[1].1, queue_spans[1].1)) AS queue_fold,
+    run_fold.1 + (run_fold.3 - run_fold.2)                           AS busy_s,
+    queue_fold.1 + (queue_fold.3 - queue_fold.2)                     AS queued_s,
+    if(time_to_verdict_s > 0, least(1., queued_s / time_to_verdict_s), NULL)                     AS queue_share,
+    if(time_to_verdict_s > 0, greatest(0., 1. - busy_s / time_to_verdict_s), NULL)              AS idle_share
+FROM ci.jobs FINAL
+GROUP BY repository, workflow, run_id, run_attempt;
+
+-- The same per head SHA, across every workflow that ran for it (each run's
+-- latest attempt): "how long until this commit had its full answer".
+CREATE VIEW ci.sha_verdicts AS
+SELECT
+    repository, sha,
+    groupUniqArray(workflow)                                         AS workflows,
+    any(event)                                                       AS event,
+    toUnixTimestamp64Milli(assumeNotNull(coalesce(min(trigger_at), min(run_created_at), min(created_at)))) / 1000 AS trigger_s,
+    countIf(completed_at IS NULL) = 0                                AS complete,
+    countIf(conclusion = 'failure') > 0                              AS red,
+    if(complete, toUnixTimestamp64Milli(assumeNotNull(max(completed_at))) / 1000 - trigger_s, NULL) AS time_to_verdict_s,
+    if(red, toUnixTimestamp64Milli(assumeNotNull(minIf(completed_at, conclusion = 'failure'))) / 1000 - trigger_s, NULL) AS time_to_first_failure_s,
+    arraySort(x -> x.1, groupArrayIf((toUnixTimestamp64Milli(assumeNotNull(started_at)) / 1000,
+                                      toUnixTimestamp64Milli(assumeNotNull(completed_at)) / 1000),
+                                     started_at IS NOT NULL AND completed_at IS NOT NULL)) AS run_spans,
+    arraySort(x -> x.1, groupArrayIf((toUnixTimestamp64Milli(assumeNotNull(created_at)) / 1000,
+                                      toUnixTimestamp64Milli(assumeNotNull(started_at)) / 1000),
+                                     created_at IS NOT NULL AND started_at IS NOT NULL AND carried_over = 0)) AS queue_spans,
+    arrayFold((acc, x) -> if(x.1 > acc.3, (acc.1 + (acc.3 - acc.2), x.1, x.2), (acc.1, acc.2, greatest(acc.3, x.2))),
+              run_spans, (0., run_spans[1].1, run_spans[1].1))   AS run_fold,
+    arrayFold((acc, x) -> if(x.1 > acc.3, (acc.1 + (acc.3 - acc.2), x.1, x.2), (acc.1, acc.2, greatest(acc.3, x.2))),
+              queue_spans, (0., queue_spans[1].1, queue_spans[1].1)) AS queue_fold,
+    run_fold.1 + (run_fold.3 - run_fold.2)                           AS busy_s,
+    queue_fold.1 + (queue_fold.3 - queue_fold.2)                     AS queued_s,
+    if(time_to_verdict_s > 0, least(1., queued_s / time_to_verdict_s), NULL)                     AS queue_share,
+    if(time_to_verdict_s > 0, greatest(0., 1. - busy_s / time_to_verdict_s), NULL)              AS idle_share
+FROM
+(
+    SELECT *, max(run_attempt) OVER (PARTITION BY repository, run_id) AS latest_attempt
+    FROM ci.jobs FINAL
+)
+WHERE run_attempt = latest_attempt
+GROUP BY repository, sha;
 
 -- A small hand-kept table for cost: what a runner label is worth.
 CREATE TABLE ci.runner_classes
@@ -408,54 +546,74 @@ ENGINE = ReplacingMergeTree
 ORDER BY label;
 ```
 
-The view for `ci.jobs` (the others follow the same pattern on their own
-`event.name`):
+The materialized views, one per event. Every expression is total (see the
+note at the top of the schema):
 
 ```sql
 CREATE MATERIALIZED VIEW ci.jobs_mv TO ci.jobs AS
+WITH LogAttributes AS a
 SELECT
-    ResourceAttributes['vcs.repository.name']                         AS repository,
-    LogAttributes['cicd.pipeline.name']                               AS workflow,
-    toUInt64OrZero(LogAttributes['cicd.pipeline.run.id'])             AS run_id,
-    toUInt16OrZero(LogAttributes['cicd.pipeline.run.attempt'])        AS run_attempt,
-    toUInt64OrZero(LogAttributes['cicd.pipeline.run.number'])         AS run_number,
-    toFixedString(LogAttributes['vcs.ref.head.revision'], 40)         AS sha,
-    LogAttributes['vcs.ref.head.name']                                AS ref,
-    LogAttributes['cicd.pipeline.trigger']                            AS event,
-    toUInt64OrZero(LogAttributes['cicd.pipeline.task.run.id'])        AS job_id,
-    LogAttributes['cicd.pipeline.task.name']                          AS job_name,
-    LogAttributes['ci.job.status']                                    AS status,
-    nullIf(LogAttributes['cicd.pipeline.task.run.result'], '')        AS conclusion,
-    toDateTime64(toFloat64OrNull(LogAttributes['ci.run.created_at']), 3, 'UTC') AS run_created_at,
-    toDateTime64(toFloat64OrNull(LogAttributes['ci.job.created_at']), 3, 'UTC')   AS created_at,
-    toDateTime64(toFloat64OrNull(LogAttributes['ci.job.started_at']), 3, 'UTC')   AS started_at,
-    toDateTime64(toFloat64OrNull(LogAttributes['ci.job.completed_at']), 3, 'UTC') AS completed_at,
-    toFloat64OrNull(LogAttributes['ci.job.queue.wait'])               AS queue_wait_s,
-    LogAttributes['ci.job.queue.basis']                               AS queue_basis,
-    toFloat64OrNull(LogAttributes['ci.job.duration'])                 AS duration_s,
-    LogAttributes['cicd.worker.name']                                 AS runner_name,
-    JSONExtract(ifNull(nullIf(LogAttributes['cicd.worker.labels'], ''), '[]'), 'Array(String)') AS labels,
-    Timestamp                                                         AS reported_at
+    ResourceAttributes['vcs.repository.name']                       AS repository,
+    a['cicd.pipeline.name']                                         AS workflow,
+    toUInt64OrZero(a['cicd.pipeline.run.id'])                       AS run_id,
+    toUInt32OrZero(a['cicd.pipeline.run.attempt'])                  AS run_attempt,
+    toUInt64OrZero(a['cicd.pipeline.run.number'])                   AS run_number,
+    a['vcs.ref.head.revision']                                      AS sha,
+    a['vcs.ref.head.name']                                          AS ref,
+    a['cicd.pipeline.trigger']                                      AS event,
+    toUInt64OrZero(a['cicd.pipeline.task.run.id'])                  AS job_id,
+    a['cicd.pipeline.task.name']                                    AS job_name,
+    a['ci.job.status']                                              AS status,
+    nullIf(a['cicd.pipeline.task.run.result'], '')                  AS conclusion,
+    toUInt8(a['ci.job.carried_over'] = 'true')                      AS carried_over,
+    ciHealthTs(a['ci.trigger.at'])                                  AS trigger_at,
+    ciHealthTs(a['ci.run.created_at'])                              AS run_created_at,
+    ciHealthTs(a['ci.job.created_at'])                              AS created_at,
+    ciHealthTs(a['ci.job.started_at'])                              AS started_at,
+    ciHealthTs(a['ci.job.completed_at'])                            AS completed_at,
+    nullIf(a['ci.job.completed.basis'], '')                         AS completed_basis,
+    toFloat64OrNull(a['ci.job.queue.wait'])                         AS queue_wait_s,
+    a['ci.job.queue.basis']                                         AS queue_basis,
+    toFloat64OrNull(a['ci.job.duration'])                           AS duration_s,
+    a['cicd.worker.name']                                           AS runner_name,
+    JSONExtract(a['cicd.worker.labels'], 'Array(String)')           AS labels,
+    Timestamp                                                       AS reported_at
 FROM otel.otel_logs
 WHERE LogAttributes['event.name'] = 'ci.job';
-```
 
-The views for the job's own record, its tests and its workers:
+CREATE MATERIALIZED VIEW ci.steps_mv TO ci.steps AS
+WITH LogAttributes AS a
+SELECT
+    ResourceAttributes['vcs.repository.name']                       AS repository,
+    a['cicd.pipeline.name']                                         AS workflow,
+    toUInt64OrZero(a['cicd.pipeline.run.id'])                       AS run_id,
+    toUInt32OrZero(a['cicd.pipeline.run.attempt'])                  AS run_attempt,
+    toUInt64OrZero(a['cicd.pipeline.task.run.id'])                  AS job_id,
+    a['cicd.pipeline.task.name']                                    AS job_name,
+    toUInt16OrZero(a['ci.step.number'])                             AS step_number,
+    a['cicd.pipeline.task.step.name']                               AS step_name,
+    nullIf(a['ci.step.result'], '')                                 AS result,
+    ifNull(ciHealthTs(a['ci.step.started_at']), Timestamp)          AS started_at,
+    ifNull(ciHealthTs(a['ci.step.completed_at']), Timestamp)        AS completed_at,
+    toFloat64OrZero(a['ci.step.duration'])                          AS duration_s,
+    Timestamp                                                       AS reported_at
+FROM otel.otel_logs
+WHERE LogAttributes['event.name'] = 'ci.step';
 
-```sql
 CREATE MATERIALIZED VIEW ci.reports_mv TO ci.reports AS
 WITH LogAttributes AS a,
-     a['ci.selection']   AS sel,
-     a['ci.parallelism'] AS par,
-     a['ci.runner']      AS rn,
+     a['ci.selection']     AS sel,
+     a['ci.parallelism']   AS par,
+     a['ci.runner']        AS rn,
      a['ci.tests.summary'] AS ts_
 SELECT
     ResourceAttributes['vcs.repository.name']                       AS repository,
     a['cicd.pipeline.name']                                         AS workflow,
     a['ci.reporter.job']                                            AS job_name,
+    toUInt64OrZero(a['ci.reporter.job.id'])                         AS job_id,
     toUInt64OrZero(a['cicd.pipeline.run.id'])                       AS run_id,
-    toUInt16OrZero(a['cicd.pipeline.run.attempt'])                  AS run_attempt,
-    toFixedString(a['vcs.ref.head.revision'], 40)                   AS sha,
+    toUInt32OrZero(a['cicd.pipeline.run.attempt'])                  AS run_attempt,
+    a['vcs.ref.head.revision']                                      AS sha,
     nullIf(a['cicd.pipeline.result'], '')                           AS outcome,
     toFloat64OrNull(a['ci.job.duration'])                           AS wall_s,
     toFloat64OrNull(a['ci.job.queue.wait'])                         AS queue_wait_s,
@@ -463,14 +621,15 @@ SELECT
     JSONExtract(rn, 'cpu_throttled_usec', 'Nullable(Float64)') / 1e6 AS cpu_throttled_s,
     JSONExtract(rn, 'cpu_limit_cores', 'Nullable(Float64)')         AS cpu_limit_cores,
     JSONExtract(rn, 'memory_peak_bytes', 'Nullable(UInt64)')        AS memory_peak_bytes,
-    CAST(JSONExtract(ifNull(nullIf(a['ci.caches'], ''), '{}'), 'Map(String, Bool)'), 'Map(LowCardinality(String), UInt8)') AS caches,
+    CAST(JSONExtract(a['ci.caches'], 'Map(String, Bool)'), 'Map(LowCardinality(String), UInt8)') AS caches,
     JSONExtract(ts_, 'count', 'Nullable(UInt32)')                   AS tests_count,
     JSONExtract(ts_, 'total_seconds', 'Nullable(Float64)')          AS tests_total_s,
     JSONExtract(ts_, 'tests_for_80pct_time', 'Nullable(UInt32)')    AS tests_for_80pct,
+    toUInt32OrZero(a['ci.tests.dropped'])                           AS tests_dropped,
     a['cicd.pipeline.trigger']                                      AS event,
     a['vcs.ref.head.name']                                          AS ref,
     toUInt32OrNull(a['vcs.change.id'])                              AS pr_number,
-    if(a['vcs.ref.base.revision'] = '', NULL, toFixedString(a['vcs.ref.base.revision'], 40)) AS base_sha,
+    nullIf(a['vcs.ref.base.revision'], '')                          AS base_sha,
     toUInt32OrNull(a['ci.merged_change.id'])                        AS merged_pr,
     JSONExtract(sel, 'mode', 'Nullable(String)')                    AS selection_mode,
     JSONExtract(sel, 'triggers', 'Array(String)')                   AS selection_triggers,
@@ -486,7 +645,7 @@ SELECT
     JSONExtract(par, 'count', 'Nullable(UInt16)')                   AS xdist_workers,
     JSONExtract(par, 'wall_max_seconds', 'Nullable(Float64)')       AS xdist_wall_max_s,
     JSONExtract(par, 'imbalance', 'Nullable(Float64)')              AS xdist_imbalance,
-    nullIf(JSONExtractRaw(par, 'db_isolated'), '')                  AS xdist_db_isolated,
+    JSONExtract(par, 'db_isolated', 'Nullable(String)')             AS xdist_db_isolated,
     Timestamp                                                       AS ts
 FROM otel.otel_logs
 WHERE LogAttributes['event.name'] = 'ci.report';
@@ -495,8 +654,9 @@ CREATE MATERIALIZED VIEW ci.workers_mv TO ci.workers AS
 SELECT
     ResourceAttributes['vcs.repository.name']                      AS repository,
     toUInt64OrZero(LogAttributes['cicd.pipeline.run.id'])          AS run_id,
-    toUInt16OrZero(LogAttributes['cicd.pipeline.run.attempt'])     AS run_attempt,
+    toUInt32OrZero(LogAttributes['cicd.pipeline.run.attempt'])     AS run_attempt,
     LogAttributes['ci.reporter.job']                               AS job_name,
+    toUInt64OrZero(LogAttributes['ci.reporter.job.id'])            AS job_id,
     JSONExtractString(w, 'id')                                     AS worker,
     JSONExtract(w, 'wall_seconds', 'Nullable(Float64)')            AS wall_s,
     JSONExtract(w, 'tests', 'Nullable(UInt32)')                    AS tests,
@@ -507,27 +667,34 @@ ARRAY JOIN JSONExtractArrayRaw(LogAttributes['ci.parallelism'], 'workers') AS w
 WHERE LogAttributes['event.name'] = 'ci.report';
 
 CREATE MATERIALIZED VIEW ci.tests_mv TO ci.tests AS
+WITH LogAttributes AS a
 SELECT
     ResourceAttributes['vcs.repository.name']                      AS repository,
-    LogAttributes['cicd.pipeline.name']                            AS workflow,
-    LogAttributes['cicd.pipeline.task.name']                       AS job_name,
-    toUInt64OrZero(LogAttributes['cicd.pipeline.run.id'])          AS run_id,
-    toUInt16OrZero(LogAttributes['cicd.pipeline.run.attempt'])     AS run_attempt,
-    toFixedString(LogAttributes['vcs.ref.head.revision'], 40)      AS sha,
-    LogAttributes['vcs.ref.head.name']                             AS ref,
-    LogAttributes['cicd.pipeline.trigger']                         AS event,
-    toUInt32OrNull(LogAttributes['vcs.change.id'])                 AS pr_number,
-    toUInt32OrNull(LogAttributes['ci.merged_change.id'])           AS merged_pr,
-    nullIf(LogAttributes['ci.selection.mode'], '')                 AS selection_mode,
-    LogAttributes['test.case.id']                                  AS test_id,
-    LogAttributes['test.suite.name']                               AS suite,
-    LogAttributes['test.case.result.status']                       AS outcome,
-    toFloat64OrZero(LogAttributes['test.case.duration'])           AS duration_s,
-    toUInt8(LogAttributes['test.case.quarantined'] = 'true')       AS quarantined,
+    a['cicd.pipeline.name']                                        AS workflow,
+    a['cicd.pipeline.task.name']                                   AS job_name,
+    toUInt64OrZero(a['ci.reporter.job.id'])                        AS job_id,
+    toUInt64OrZero(a['cicd.pipeline.run.id'])                      AS run_id,
+    toUInt32OrZero(a['cicd.pipeline.run.attempt'])                 AS run_attempt,
+    a['vcs.ref.head.revision']                                     AS sha,
+    a['vcs.ref.head.name']                                         AS ref,
+    a['cicd.pipeline.trigger']                                     AS event,
+    toUInt32OrNull(a['vcs.change.id'])                             AS pr_number,
+    toUInt32OrNull(a['ci.merged_change.id'])                       AS merged_pr,
+    nullIf(a['ci.selection.mode'], '')                             AS selection_mode,
+    a['test.case.id']                                              AS test_id,
+    a['test.suite.name']                                           AS suite,
+    a['test.case.result.status']                                   AS outcome,
+    toFloat64OrZero(a['test.case.duration'])                       AS duration_s,
+    toUInt8(a['test.case.quarantined'] = 'true')                   AS quarantined,
     Timestamp                                                      AS ts
 FROM otel.otel_logs
 WHERE LogAttributes['event.name'] = 'ci.test';
 ```
+
+**Retention.** Every `ci.*` table carries a TTL. The source `otel_logs` table
+is the OTel exporter's and is shared: give it a TTL of its own (days are
+enough once the views have copied the rows), or route `mira_vitals.ci` records
+to a separate logs table in the collector, so CI records do not set its size.
 
 ## Queries
 
@@ -543,6 +710,7 @@ SELECT repository, workflow, job_name,
        quantiles(0.5, 0.9, 0.99)(queue_wait_s) AS queue_p50_p90_p99
 FROM ci.jobs FINAL
 WHERE started_at >= now() - INTERVAL 30 DAY AND conclusion IS NOT NULL
+  AND conclusion != 'skipped' AND carried_over = 0
 GROUP BY repository, workflow, job_name
 ORDER BY quantile(0.9)(duration_s) + quantile(0.9)(queue_wait_s) DESC;
 ```
@@ -554,6 +722,7 @@ SELECT arrayJoin(labels) AS label, toHour(created_at) AS hour_utc,
        count() AS jobs, quantile(0.5)(queue_wait_s) AS p50, quantile(0.9)(queue_wait_s) AS p90
 FROM ci.jobs FINAL
 WHERE created_at >= now() - INTERVAL 14 DAY AND queue_basis = 'job_created'
+  AND ifNull(conclusion, '') != 'skipped' AND carried_over = 0
 GROUP BY label, hour_utc
 ORDER BY label, hour_utc;
 ```
@@ -679,6 +848,61 @@ FROM ci.reports FINAL
 WHERE ts >= now() - INTERVAL 14 DAY
 GROUP BY repository, job_name
 ORDER BY throttled_share_p90 DESC;
+```
+
+## Feedback latency (the primary metric)
+
+Wall-clock time until a developer has an answer matters more than
+runner-minutes. Where each part is computed:
+
+* **in the job** (`mira-vitals ci report`): each job's queue wait, start and
+  completion, for every job of *its own run* (platform adapter), its own
+  completion at report time, and the push time (`repository.pushed_at`);
+* **in the store** (`ci.run_verdicts`, `ci.sha_verdicts`): time to verdict,
+  time to first failure, queue and idle share, per run and per head SHA. A
+  reporter never sees sibling workflows, so the per-SHA answer is
+  assembled from `ci.jobs` across workflows, latest attempt of each run.
+
+A verdict is only as complete as the instrumentation: a workflow whose last
+job has no ci-health report leaves that job without a completion, and the
+verdict stays NULL (incomplete) rather than ending early.
+
+**Time to verdict and time to first failure, per repository and hour**
+
+```sql
+SELECT repository, toStartOfHour(toDateTime(trigger_s)) AS hour, count() AS shas,
+       quantiles(0.5, 0.9)(time_to_verdict_s)       AS verdict_p50_p90_s,
+       quantiles(0.5, 0.9)(time_to_first_failure_s) AS first_failure_p50_p90_s,
+       quantile(0.5)(queue_share)                   AS queue_share_p50,
+       quantile(0.5)(idle_share)                    AS idle_share_p50,
+       countIf(NOT complete)                        AS incomplete
+FROM ci.sha_verdicts
+WHERE trigger_s >= toUnixTimestamp(now() - INTERVAL 14 DAY)
+GROUP BY repository, hour
+ORDER BY repository, hour;
+```
+
+**Feedback latency before/after an optimization** (selector version and
+xdist worker count of the SHA's runs)
+
+```sql
+SELECT v.repository AS repository, o.selector AS selector, o.workers AS workers,
+       count()                                        AS shas,
+       quantiles(0.5, 0.9)(v.time_to_verdict_s)       AS verdict_p50_p90_s,
+       quantiles(0.5, 0.9)(v.time_to_first_failure_s) AS first_failure_p50_p90_s,
+       quantile(0.5)(v.queue_share)                   AS queue_share_p50
+FROM ci.sha_verdicts AS v
+INNER JOIN
+(
+    SELECT repository, sha,
+           ifNull(any(selector_version), 'none') AS selector,
+           ifNull(max(xdist_workers), 1)         AS workers
+    FROM ci.reports FINAL
+    GROUP BY repository, sha
+) AS o ON o.repository = v.repository AND o.sha = v.sha
+WHERE v.complete
+GROUP BY repository, selector, workers
+ORDER BY repository, selector, workers;
 ```
 
 ## Optimization efficacy
