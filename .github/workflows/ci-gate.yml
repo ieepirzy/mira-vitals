@@ -1,0 +1,133 @@
+# The CI gate: one check that says whether a run is green, for callers whose
+# jobs are skipped by path filters (a job-level `if:`).
+#
+# Why it exists. GitHub shows a job skipped by `if:` as a passing check, and a
+# workflow skipped by trigger-level `paths:` as a check that never reports
+# (pending forever). Neither tells a reader whether the skipped work was
+# actually unnecessary. This job decides that from what the caller declares:
+#
+#   needs     the caller's `toJSON(needs)`: every job it gates on, with result
+#   required  a JSON object job -> true/false: was this job needed for this
+#             change? Usually built from the caller's `changes` job outputs.
+#
+# Verdict (fail closed):
+#   - a required job passes only with result `success`; failure, cancelled or
+#     skipped is red;
+#   - a job missing from `required`, or with any value other than false, is
+#     required;
+#   - a job not required may be `skipped` or `success`; failure or cancelled is
+#     still red (it ran, or was stopped, and the run is not clean);
+#   - malformed input, an empty `needs`, or a required name that is not in
+#     `needs` is red.
+#
+# Caller shape (see docs/ci-gate.md):
+#
+#   ci-gate:
+#     needs: [changes, contracts, tofu, ...]   # every job
+#     if: always()
+#     uses: ieepirzy/mira-vitals/.github/workflows/ci-gate.yml@<sha>
+#     with:
+#       needs: ${{ toJSON(needs) }}
+#       required: '{"tofu": ${{ needs.changes.outputs.tofu }}, ...}'
+#       runs-on: '"mira-ci"'        # optional; default GitHub-hosted
+#
+# Never put trigger-level `paths:` on a workflow whose checks a merge waits on.
+#
+# runs-on: JSON, as fromJSON takes it (a label string or a list). The default is
+# GitHub-hosted, which costs a public caller nothing. A private caller is billed
+# at least one hosted minute per gate job, so a high-volume private repository
+# should pass its self-hosted label instead.
+name: CI gate
+
+on:
+  workflow_call:
+    inputs:
+      needs:
+        description: The caller's toJSON(needs).
+        required: true
+        type: string
+      required:
+        description: JSON object job name -> true/false (needed for this change).
+        required: true
+        type: string
+      runs-on:
+        description: JSON runs-on value (a label string or list).
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+
+permissions: {}
+
+jobs:
+  gate:
+    name: verdict
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    steps:
+      - name: Decide
+        env:
+          GATE_NEEDS: ${{ inputs.needs }}
+          GATE_REQUIRED: ${{ inputs.required }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v python3 >/dev/null || { echo "::error::ci-gate needs python3 on the runner"; exit 1; }
+          python3 -I - <<'PY'
+          # ci-gate verdict (tests/test_ci_gate.py runs this block as-is).
+          import json, os, sys
+
+          def fail(msg):
+              print(f"::error::ci-gate: {msg}")
+              sys.exit(1)
+
+          def clean(text):
+              # Job names come from the caller's workflow; keep the log free of
+              # anything that could start a workflow command.
+              return str(text).replace("\r", " ").replace("\n", " ").replace("::", ": :")
+
+          try:
+              needs = json.loads(os.environ.get("GATE_NEEDS", ""))
+          except ValueError:
+              fail("`needs` is not JSON (pass toJSON(needs))")
+          try:
+              required = json.loads(os.environ.get("GATE_REQUIRED", ""))
+          except ValueError:
+              fail("`required` is not JSON (an object job -> true/false)")
+          if not isinstance(needs, dict) or not needs:
+              fail("`needs` is empty: list every gated job in the caller's `needs`")
+          if not isinstance(required, dict):
+              fail("`required` must be a JSON object")
+          unknown = sorted(set(required) - set(needs))
+          if unknown:
+              fail("`required` names jobs the gate does not wait on: " + ", ".join(clean(u) for u in unknown))
+
+          def is_required(name):
+              value = required.get(name, True)
+              # Only an explicit false (boolean, or the string a job output
+              # carries) makes a job optional; anything else fails closed.
+              return not (value is False or (isinstance(value, str) and value.strip().lower() == "false"))
+
+          rows, red = [], []
+          for name in sorted(needs):
+              job = needs[name] if isinstance(needs[name], dict) else {}
+              result = job.get("result")
+              req = is_required(name)
+              if req:
+                  ok = result == "success"
+              else:
+                  ok = result in ("success", "skipped")
+              rows.append((name, "required" if req else "not needed", result, ok))
+              if not ok:
+                  red.append(name)
+
+          lines = ["| job | for this change | result | ok |", "|---|---|---|---|"]
+          lines += [f"| {clean(n)} | {r} | {clean(res)} | {'yes' if ok else 'NO'} |" for n, r, res, ok in rows]
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as f:
+                  f.write("### CI gate\n\n" + "\n".join(lines) + "\n")
+          print("\n".join(lines))
+          if red:
+              fail("not green: " + ", ".join(clean(n) for n in red))
+          print("ci-gate: green")
+          PY
