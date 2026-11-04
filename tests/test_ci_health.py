@@ -452,3 +452,34 @@ def test_an_unexpected_crash_is_a_warning(env, monkeypatch, capsys):
     monkeypatch.setattr(command, "_report", boom)
     assert command.main(["report"], env=env) == 0
     assert "::warning" in capsys.readouterr().out
+
+
+def test_action_metadata_carries_no_expression_outside_defaults_and_steps():
+    """GitHub evaluates `${{ }}` in an action's metadata when it loads it, with
+    only a few contexts available. One in an input description made the
+    action fail to load, which failed the calling job: the one thing this
+    command must never do. Text-based, so no YAML dependency."""
+    import os
+    import re
+
+    path = os.path.join(os.path.dirname(__file__), "..", ".github", "actions", "ci-health", "action.yml")
+    with open(path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    in_runs = False
+    seen = 0
+    for number, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if line.startswith("runs:"):
+            in_runs = True
+        for expr in re.findall(r"\$\{\{(.*?)\}\}", line):
+            seen += 1
+            root = expr.strip().split(".")[0]
+            if in_runs:
+                assert root in ("steps", "inputs", "github"), (number, line)
+            else:
+                # Before `runs:` only an input default may hold one, and only
+                # from the github context.
+                assert stripped.startswith("default:") and root == "github", (number, line)
+    assert seen > 0

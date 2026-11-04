@@ -47,7 +47,10 @@ inputs:
     description: "Cache outcomes as name=hit pairs, comma-separated, e.g. uv=true,npm=false. Empty values are ignored."
     default: ""
   outcome:
-    description: "The job's status so far; pass ${{ job.status }}."
+    # Never write an expression in a description: GitHub evaluates them when
+    # it loads this file, and `job` is not available there, so the action
+    # would fail to load and fail the job (tests/test_ci_health.py checks).
+    description: "The job's status so far: pass the job context's status."
     default: ""
   output:
     description: "Where the ci-health.json document is written."
