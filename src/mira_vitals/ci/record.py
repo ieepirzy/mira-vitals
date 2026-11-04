@@ -93,6 +93,8 @@ def build(
         "steps": (self_job or {}).get("steps") or [],
     }
 
+    if runner and isinstance(runner.get("cpu_usage_usec"), int) and wall:
+        runner["cpu_avg_cores"] = round(runner["cpu_usage_usec"] / 1e6 / wall, 3)
     tests_summary = junit_module.summarize(tests) if test_files else None
     # The document keeps every failure and then the slowest tests, up to the
     # cap; the summary above is over all of them. `dropped` says how many
@@ -260,6 +262,8 @@ def log_records(doc: dict[str, Any], *, max_tests: int) -> list[dict[str, Any]]:
             "cicd.pipeline.result": job.get("outcome"),
             "cicd.worker.name": job.get("runner_name"),
             "cicd.worker.labels": job.get("labels") or None,
+            "k8s.node.name": doc["identity"].get("node_name"),
+            "k8s.pod.name": doc["identity"].get("runner_name"),
             "ci.tests.summary": {k: v for k, v in summary.items() if k != "slowest"} or None,
             "ci.runner": doc["runner"] or None,
             "ci.caches": doc["caches"] or None,

@@ -244,7 +244,16 @@ CREATE TABLE ci.reports
     cpu_usage_s       Nullable(Float64),
     cpu_throttled_s   Nullable(Float64),
     cpu_limit_cores   Nullable(Float64),
+    cpu_quota_usec    Nullable(UInt64),    -- cgroup cpu.max quota (NULL: no limit)
+    cpu_period_usec   Nullable(UInt64),
+    cpu_avg_cores     Nullable(Float64),   -- CPU used / wall time
+    cpu_peak_cores    Nullable(Float64),   -- busiest 5 s sample
+    cpu_p95_cores     Nullable(Float64),
     memory_peak_bytes Nullable(UInt64),
+    -- Where it ran, for co-tenancy: the node (when the runner exposes it)
+    -- and the runner pod (always), which ci.runner_nodes maps to a node.
+    node_name         LowCardinality(Nullable(String)),
+    runner_pod        String,
     -- Every cache by name: uv, npm, docker (layers), test-results, ...
     caches            Map(LowCardinality(String), UInt8),
     tests_count       Nullable(UInt32),
@@ -536,6 +545,55 @@ FROM
 WHERE run_attempt = latest_attempt
 GROUP BY repository, sha;
 
+-- Runner pod -> node, for runners that do not expose their node name
+-- (ARC's default template does not). Fed from cluster metrics
+-- (kube-state-metrics kube_pod_info{namespace="arc-runners"}), a later
+-- producer; reserved now.
+CREATE TABLE ci.runner_nodes
+(
+    pod     String,
+    node    LowCardinality(String),
+    seen_at DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree(seen_at)
+ORDER BY pod
+TTL toDateTime(seen_at) + INTERVAL 400 DAY;
+
+-- Co-tenancy: each reported job with the other reported jobs that ran on
+-- the same node while it ran. The before/after evidence for packing two
+-- runners per node, beside time to verdict.
+CREATE VIEW ci.job_cotenancy AS
+WITH placed AS
+(
+    SELECT r.repository AS repository, r.workflow AS workflow, r.job_name AS job_name, r.job_id AS job_id,
+           r.run_id AS run_id, r.run_attempt AS run_attempt,
+           coalesce(r.node_name, n.node) AS node,
+           toUnixTimestamp64Milli(assumeNotNull(j.started_at)) / 1000   AS s,
+           toUnixTimestamp64Milli(assumeNotNull(j.completed_at)) / 1000 AS e,
+           j.duration_s AS duration_s, r.cpu_throttled_s AS throttled_s, r.wall_s AS wall_s,
+           r.cpu_limit_cores AS limit_cores, r.cpu_peak_cores AS peak_cores
+    FROM ci.reports AS r FINAL
+    INNER JOIN ci.jobs AS j FINAL
+        ON j.repository = r.repository AND j.run_id = r.run_id AND j.run_attempt = r.run_attempt AND j.job_id = r.job_id
+    LEFT JOIN ci.runner_nodes AS n FINAL ON n.pod = r.runner_pod
+    WHERE j.started_at IS NOT NULL AND j.completed_at IS NOT NULL
+      AND coalesce(r.node_name, n.node) IS NOT NULL AND coalesce(r.node_name, n.node) != ''
+)
+SELECT a.repository AS repository, a.workflow AS workflow, a.job_name AS job_name, a.job_id AS job_id,
+       a.run_id AS run_id, a.node AS node, a.duration_s AS duration_s, a.throttled_s AS throttled_s,
+       a.wall_s AS wall_s, a.limit_cores AS limit_cores, a.peak_cores AS peak_cores,
+       countIf(b.job_id != 0 AND NOT (b.job_id = a.job_id AND b.run_id = a.run_id)
+               AND b.s < a.e AND b.e > a.s)                                       AS cotenants,
+       sumIf(least(a.e, b.e) - greatest(a.s, b.s),
+             b.job_id != 0 AND NOT (b.job_id = a.job_id AND b.run_id = a.run_id)
+             AND b.s < a.e AND b.e > a.s)                                         AS overlap_s,
+       groupArrayIf(concat(b.repository, ' / ', b.job_name),
+                    b.job_id != 0 AND NOT (b.job_id = a.job_id AND b.run_id = a.run_id)
+                    AND b.s < a.e AND b.e > a.s)                                  AS cotenant_jobs
+FROM placed AS a
+LEFT JOIN placed AS b ON b.node = a.node
+GROUP BY repository, workflow, job_name, job_id, run_id, node, duration_s, throttled_s, wall_s, limit_cores, peak_cores;
+
 -- A small hand-kept table for cost: what a runner label is worth.
 CREATE TABLE ci.runner_classes
 (
@@ -620,7 +678,14 @@ SELECT
     JSONExtract(rn, 'cpu_usage_usec', 'Nullable(Float64)') / 1e6    AS cpu_usage_s,
     JSONExtract(rn, 'cpu_throttled_usec', 'Nullable(Float64)') / 1e6 AS cpu_throttled_s,
     JSONExtract(rn, 'cpu_limit_cores', 'Nullable(Float64)')         AS cpu_limit_cores,
+    JSONExtract(rn, 'cpu_quota_usec', 'Nullable(UInt64)')           AS cpu_quota_usec,
+    JSONExtract(rn, 'cpu_period_usec', 'Nullable(UInt64)')          AS cpu_period_usec,
+    JSONExtract(rn, 'cpu_avg_cores', 'Nullable(Float64)')           AS cpu_avg_cores,
+    JSONExtract(rn, 'cpu_peak_cores', 'Nullable(Float64)')          AS cpu_peak_cores,
+    JSONExtract(rn, 'cpu_p95_cores', 'Nullable(Float64)')           AS cpu_p95_cores,
     JSONExtract(rn, 'memory_peak_bytes', 'Nullable(UInt64)')        AS memory_peak_bytes,
+    nullIf(a['k8s.node.name'], '')                                  AS node_name,
+    a['k8s.pod.name']                                               AS runner_pod,
     CAST(JSONExtract(a['ci.caches'], 'Map(String, Bool)'), 'Map(LowCardinality(String), UInt8)') AS caches,
     JSONExtract(ts_, 'count', 'Nullable(UInt32)')                   AS tests_count,
     JSONExtract(ts_, 'total_seconds', 'Nullable(Float64)')          AS tests_total_s,
@@ -903,6 +968,45 @@ INNER JOIN
 WHERE v.complete
 GROUP BY repository, selector, workers
 ORDER BY repository, selector, workers;
+```
+
+## Contention: runners sharing a node
+
+Runners are packed two per node (4 cores shared). Each report records the
+node (`NODE_NAME` from the downward API, when the runner template sets it:
+`env: [{name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}]`
+on the runner container) and always the runner pod, which `ci.runner_nodes`
+maps to a node otherwise; the cgroup CPU quota and period, CPU used, the
+average and the peak (from 5-second samples taken by `ci start`'s detached,
+self-stopping sampler) and the throttled time. `ci.job_cotenancy` pairs every
+job with the jobs that overlapped it on its node.
+
+**Job duration with and without a co-tenant, per repository and job**
+
+```sql
+SELECT repository, job_name,
+       countIf(cotenants = 0)                                     AS alone_runs,
+       countIf(cotenants > 0)                                     AS shared_runs,
+       quantileIf(0.5)(duration_s, cotenants = 0)                 AS alone_p50_s,
+       quantileIf(0.5)(duration_s, cotenants > 0)                 AS shared_p50_s,
+       quantileIf(0.9)(duration_s, cotenants = 0)                 AS alone_p90_s,
+       quantileIf(0.9)(duration_s, cotenants > 0)                 AS shared_p90_s,
+       shared_p50_s / nullIf(alone_p50_s, 0)                      AS slowdown_p50,
+       avgIf(throttled_s / nullIf(wall_s, 0), cotenants = 0)      AS throttled_share_alone,
+       avgIf(throttled_s / nullIf(wall_s, 0), cotenants > 0)      AS throttled_share_shared
+FROM ci.job_cotenancy
+GROUP BY repository, job_name
+ORDER BY slowdown_p50 DESC;
+```
+
+**Which jobs ran together** (the co-tenants of the slowest shared runs)
+
+```sql
+SELECT repository, job_name, run_id, node, duration_s, cotenants, round(overlap_s) AS overlap_s, cotenant_jobs
+FROM ci.job_cotenancy
+WHERE cotenants > 0
+ORDER BY duration_s DESC
+LIMIT 50;
 ```
 
 ## Optimization efficacy

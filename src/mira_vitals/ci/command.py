@@ -53,6 +53,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mira-vitals ci", description="CI-health telemetry. Never fails the build.")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("start", help="Open the job's clock and take a resource baseline (first step).")
+    # Internal: the detached CPU sampler `start` launches.
+    sub.add_parser("sample", help=argparse.SUPPRESS)
     mark = sub.add_parser("mark", help="Close a phase named after this mark.")
     mark.add_argument("name")
     report = sub.add_parser("report", help="Measure, write ci-health.json, export (last step, if: always()).")
@@ -81,13 +83,61 @@ def _baseline_path(env: dict[str, str]) -> str:
     return os.path.join(marks.state_dir(env), "cgroup-start.json")
 
 
+def _samples_path(env: dict[str, str]) -> str:
+    return os.path.join(marks.state_dir(env), "cpu-samples.jsonl")
+
+
+def _stop_path(env: dict[str, str]) -> str:
+    return os.path.join(marks.state_dir(env), "cpu-samples.stop")
+
+
 def _start(env: dict[str, str]) -> None:
     marks.record(marks.START, env=env)
+    root = env.get("MIRA_VITALS_CGROUP_ROOT") or cgroup.ROOT
+    baseline = cgroup.read(root)
     try:
         with open(_baseline_path(env), "w", encoding="utf-8") as handle:
-            json.dump(cgroup.read(env.get("MIRA_VITALS_CGROUP_ROOT") or cgroup.ROOT), handle)
+            json.dump(baseline, handle)
     except OSError as exc:
         _warn(f"could not save the resource baseline: {exc}")
+    # A detached sampler for peak CPU (the average alone hides contention).
+    # Only where the cgroup is readable; it stops itself (see sample_loop).
+    if baseline.get("cpu_usage_usec") is not None and env.get("MIRA_VITALS_CI_NO_SAMPLER") != "1":
+        import subprocess
+
+        try:
+            subprocess.Popen(  # noqa: S603 - our own interpreter and module, fixed argv
+                [sys.executable, "-P", "-m", "mira_vitals", "ci", "sample"],
+                env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True,
+            )
+        except OSError as exc:
+            _warn(f"could not start the CPU sampler: {exc}")
+
+
+def _sample(env: dict[str, str]) -> None:
+    cgroup.sample_loop(env.get("MIRA_VITALS_CGROUP_ROOT") or cgroup.ROOT, _samples_path(env), _stop_path(env))
+
+
+def _read_samples(env: dict[str, str]) -> list[dict[str, Any]]:
+    try:
+        with open(_stop_path(env), "w", encoding="utf-8"):
+            pass
+    except OSError:
+        pass
+    out: list[dict[str, Any]] = []
+    try:
+        with open(_samples_path(env), encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict) and all(isinstance(item.get(k), (int, float)) for k in ("t", "u")):
+                    out.append(item)
+    except OSError:
+        return []
+    return out[: cgroup.MAX_SAMPLES]
 
 
 def _caches(pairs: list[str], env: dict[str, str], warnings: list[str]) -> dict[str, bool]:
@@ -132,6 +182,14 @@ def _identity(env: dict[str, str], platform: str | None) -> dict[str, Any]:
         "ref": env.get("GITHUB_REF_NAME"),
         "event": env.get("GITHUB_EVENT_NAME"),
         "runner_name": env.get("RUNNER_NAME"),
+        # The node the runner pod ran on, for co-tenancy. ARC does not set it
+        # by default: the runner template exposes it through the downward API
+        # (env NODE_NAME from spec.nodeName). Without it the store maps the
+        # pod (runner_name) to its node from cluster metrics.
+        "node_name": next(
+            (env[k] for k in ("MIRA_VITALS_NODE_NAME", "NODE_NAME", "K8S_NODE_NAME", "KUBERNETES_NODE_NAME") if env.get(k)),
+            None,
+        ),
         "runner_os": env.get("RUNNER_OS"),
         "runner_arch": env.get("RUNNER_ARCH"),
         "url": url,
@@ -225,6 +283,7 @@ def _report(args: argparse.Namespace, env: dict[str, str]) -> None:
     except (OSError, json.JSONDecodeError):
         baseline = None
     runner = cgroup.delta(cgroup.read(env.get("MIRA_VITALS_CGROUP_ROOT") or cgroup.ROOT), baseline)
+    runner.update(cgroup.summarize_samples(_read_samples(env)))
 
     identity = collector_identity()
     # The action runs the code from its own checkout, so the ref it was
@@ -340,6 +399,8 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
     try:
         if args.command == "start":
             _start(env)
+        elif args.command == "sample":
+            _sample(env)
         elif args.command == "mark":
             marks.record(args.name, env=env)
         elif args.command == "report":

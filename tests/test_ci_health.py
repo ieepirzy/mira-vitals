@@ -867,3 +867,63 @@ def test_push_trigger_time_from_the_event(tmp_path):
     assert optimizations.pr_linkage({"GITHUB_EVENT_PATH": str(event)})["trigger_at"] == 1762200000.0
     event.write_text(json.dumps({"pull_request": {"number": 1}, "repository": {"pushed_at": "2026-01-01T00:00:00Z"}}))
     assert optimizations.pr_linkage({"GITHUB_EVENT_PATH": str(event)})["trigger_at"] is None
+
+
+# --- co-tenancy: node, CPU quota and peak -------------------------------------
+
+
+def test_sampler_stops_on_the_stop_file_and_never_exceeds_its_cap(tmp_path):
+    root = tmp_path / "cg"
+    _cgroup(root, 1_000_000, 0, 1)
+    state = tmp_path / "state"
+    state.mkdir()
+    path, stop = str(state / "s.jsonl"), str(state / "stop")
+    clock = iter(float(i) for i in range(100))
+    calls = []
+
+    def fake_sleep(seconds):
+        calls.append(seconds)
+        if len(calls) == 3:
+            open(stop, "w").close()
+
+    assert cgroup.sample_loop(str(root), path, stop, sleep=fake_sleep, clock=lambda: next(clock)) == 3
+    import os
+
+    os.remove(stop)
+    assert cgroup.sample_loop(str(root), path, stop, max_samples=4, sleep=lambda s: None, clock=lambda: 1.0) == 4
+    # No readable cgroup: nothing to sample, ends at once.
+    assert cgroup.sample_loop(str(tmp_path / "none"), path, stop, sleep=lambda s: None) == 0
+
+
+def test_peak_and_p95_cores_from_samples():
+    samples = [{"t": 0, "u": 0}, {"t": 5, "u": 5_000_000}, {"t": 10, "u": 25_000_000}, {"t": 15, "u": 30_000_000}]
+    got = cgroup.summarize_samples(samples)
+    assert got["cpu_peak_cores"] == 4.0  # 20 s of CPU in a 5 s window
+    assert got["cpu_samples"] == 4
+    assert cgroup.summarize_samples([{"t": 0, "u": 0}])["cpu_peak_cores"] is None
+
+
+def test_cgroup_quota_and_period_are_recorded(tmp_path):
+    root = tmp_path / "cg"
+    _cgroup(root, 1, 0, 1)
+    sample = cgroup.read(str(root))
+    assert (sample["cpu_quota_usec"], sample["cpu_period_usec"], sample["cpu_limit_cores"]) == (200000, 100000, 2.0)
+
+
+def test_report_records_node_pod_and_average_cores(env, tmp_path):
+    root = tmp_path / "cg"
+    _cgroup(root, 0, 0, 1)
+    e = {**env, "MIRA_VITALS_CGROUP_ROOT": str(root), "MIRA_VITALS_CI_NO_SAMPLER": "1",
+         "NODE_NAME": "muutto365-ci-abc", "RUNNER_NAME": "runner-pod-1"}
+    command.main(["start"], env=e)
+    _cgroup(root, 30_000_000, 2_000_000, 2**30)
+    import time as time_module
+
+    time_module.sleep(0.2)
+    out = tmp_path / "d.json"
+    command.main(["report", "--no-export", "--quiet", "--output", str(out)], env=e)
+    doc = json.loads(out.read_text())
+    assert doc["identity"]["node_name"] == "muutto365-ci-abc"
+    assert doc["runner"]["cpu_avg_cores"] > 0
+    attrs = record.log_records(doc, max_tests=0)[0]["attributes"]
+    assert attrs["k8s.node.name"] == "muutto365-ci-abc" and attrs["k8s.pod.name"] == "runner-pod-1"
