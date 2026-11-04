@@ -221,8 +221,30 @@ def _summary_markdown(doc: dict[str, Any], export_status: dict[str, Any]) -> str
             f"memory peak {f'{round(peak / 2**20)} MiB' if peak is not None else 'n/a'}"
             + ("" if runner.get("baseline") else " (no start baseline: counters may span earlier work)")
         )
+    if runner.get("cpu_peak_cores") is not None:
+        lines.append(
+            f"- Runner CPU peak {runner['cpu_peak_cores']} cores, p95 {runner.get('cpu_p95_cores')}, "
+            f"average {runner.get('cpu_avg_cores')} ({runner.get('cpu_samples')} samples)"
+        )
+    node = doc["identity"].get("node_name")
+    if node:
+        lines.append(f"- Node: {_cell(node, 80)}")
     if doc["caches"]:
         lines.append("- Caches: " + ", ".join(f"{k} {'hit' if v else 'miss'}" for k, v in sorted(doc["caches"].items())))
+    opts = doc.get("optimizations") or {}
+    par = opts.get("parallelism")
+    if par:
+        lines.append(
+            f"- Parallelism: {par.get('count')} xdist workers, database per worker: "
+            f"{_cell(par.get('db_isolated') or 'unknown', 10)}"
+            + (f", imbalance {par['imbalance']}" if par.get("imbalance") is not None else "")
+        )
+    sel = opts.get("selection")
+    if sel:
+        lines.append(
+            f"- Test selection: {sel['mode']}, {sel.get('selected')} of {sel.get('total')} tests"
+            + (f"; full because {', '.join(sel['triggers'])}" if sel.get("triggers") else "")
+        )
     steps = sorted(
         (st for st in job.get("steps") or [] if st.get("duration_seconds") is not None),
         key=lambda st: st["duration_seconds"],
