@@ -402,11 +402,17 @@ def test_metric_attributes_are_bounded():
                                                             "duration_seconds": 1.0}],
         tests=[], test_files=[], caches={"uv": True}, runner={"cpu_usage_usec": 5}, outcome="success",
         warnings=[], generated_by={"version": "0.1.0"}, now=10.0,
+        optimizations={
+            "selection": {"mode": "full", "triggers": ["conftest", "deps"], "selected": 10, "total": 10,
+                          "estimated_saved_seconds": 0.0, "closure_cache_hits": 0},
+            "parallelism": {"count": 4, "wall_max_seconds": 30.0, "imbalance": 1.2},
+        },
     )
     keys = _metric_attr_keys(record.otlp_metrics_body(doc, 1))
     assert keys <= {
         "cicd.pipeline.name", "cicd.pipeline.task.name", "cicd.worker.labels", "cicd.pipeline.result",
         "ci.phase.name", "cicd.pipeline.task.step.name", "test.outcome", "ci.cache.name",
+        "ci.selection.mode", "ci.selection.trigger",
     }
 
 
@@ -483,3 +489,98 @@ def test_action_metadata_carries_no_expression_outside_defaults_and_steps():
                 # from the github context.
                 assert stripped.startswith("default:") and root == "github", (number, line)
     assert seen > 0
+
+
+# --- optimizations: selection, parallelism, quarantine, PR linkage ----------
+
+
+def test_selection_record_is_validated(tmp_path):
+    from mira_vitals.ci import optimizations
+
+    path = tmp_path / "selection.json"
+    path.write_text(json.dumps({
+        "mode": "selected", "triggers": ["conftest", "Not Allowed!"], "selected": 812, "total": 2629,
+        "estimated_saved_seconds": 940, "selector": {"name": "mira-vitals-select", "version": "0.2.0"},
+        "graph": {"source": "ruff", "ruff_version": "0.16.4", "lomitus_version": "1.3.0"},
+        "closure_cache_hits": 1500,
+    }))
+    warnings = []
+    got = optimizations.selection(str(path), warnings)
+    assert got["mode"] == "selected" and got["selected"] == 812 and got["total"] == 2629
+    assert got["triggers"] == ["conftest"] and any("Not Allowed" in w for w in warnings)
+    assert (got["selector_version"], got["ruff_version"], got["lomitus_version"]) == ("0.2.0", "0.16.4", "1.3.0")
+    path.write_text(json.dumps({"mode": "selected", "selected": 5, "total": 2}))
+    assert optimizations.selection(str(path), [])["selected"] is None  # impossible counts dropped
+    path.write_text(json.dumps({"mode": "partial"}))
+    assert optimizations.selection(str(path), []) is None
+    path.write_text("{not json")
+    warnings = []
+    assert optimizations.selection(str(path), warnings) is None and warnings
+
+
+def test_worker_imbalance_and_isolation(tmp_path):
+    from mira_vitals.ci import optimizations
+
+    path = tmp_path / "workers.json"
+    path.write_text(json.dumps({"workers": [
+        {"id": "gw0", "wall_seconds": 100, "tests": 600, "db_isolated": True},
+        {"id": "gw1", "wall_seconds": 300, "tests": 700, "db_isolated": True},
+    ]}))
+    got = optimizations.workers(str(path), None, [])
+    assert got["count"] == 2 and got["wall_max_seconds"] == 300 and got["imbalance"] == 1.5
+    assert got["db_isolated"] is True
+    assert optimizations.workers(None, 8, [])["count"] == 8
+    assert optimizations.workers(None, None, []) is None
+
+
+def test_pr_linkage_from_ref_and_event(tmp_path):
+    from mira_vitals.ci import optimizations
+
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"pull_request": {"number": 148, "base": {"sha": "b" * 40}, "head": {"sha": "h" * 40}}}))
+    got = optimizations.pr_linkage({"GITHUB_REF": "refs/pull/148/merge", "GITHUB_EVENT_PATH": str(event)})
+    assert got == {"pr_number": 148, "base_sha": "b" * 40, "head_sha": "h" * 40}
+    assert optimizations.pr_linkage({"GITHUB_REF": "refs/heads/main"})["pr_number"] is None
+
+
+def test_report_carries_selection_workers_quarantine_and_merged_pr(env, tmp_path):
+    from mira_vitals.ci import optimizations
+
+    junit_path = tmp_path / "junit.xml"
+    junit_path.write_text(JUNIT)
+    state = env["MIRA_VITALS_CI_DIR"]
+    import os
+
+    os.makedirs(state, exist_ok=True)
+    with open(os.path.join(state, "selection.json"), "w") as handle:
+        json.dump({"mode": "selected", "triggers": [], "selected": 5, "total": 20, "estimated_saved_seconds": 30}, handle)
+    with open(os.path.join(state, "quarantine.json"), "w") as handle:
+        json.dump({"test_ids": ["tests/test_b.py::test_broken"]}, handle)
+    run = dict(GH_RUN, event="push")
+    api = _Api({
+        "/repos/o/r/actions/runs/7/attempts/1/jobs": (200, GH_JOBS),
+        "/repos/o/r/actions/runs/7": (200, run),
+        "/repos/o/r/commits/": (200, [{"number": 41, "merged_at": "2026-11-03T14:18:00Z"}]),
+    })
+    out = tmp_path / "doc.json"
+    try:
+        assert command.main(
+            ["report", "--junit", str(junit_path), "--workers", "4", "--no-export", "--output", str(out), "--quiet"],
+            env=_gh_env(env, api),
+        ) == 0
+    finally:
+        api.close()
+    doc = json.loads(out.read_text())
+    assert doc["optimizations"]["selection"]["selected"] == 5
+    assert doc["optimizations"]["parallelism"]["count"] == 4
+    assert doc["identity"]["merged_pr_number"] == 41
+    broken = next(c for c in doc["tests"]["cases"] if c["name"] == "test_broken")
+    assert broken["quarantined"] is True
+    records = record.log_records(doc, max_tests=100)
+    assert records[0]["attributes"]["ci.merged_change.id"] == 41
+    assert records[0]["attributes"]["ci.selection"]["mode"] == "selected"
+    # The escape join reads the selection mode and PR link on every test row.
+    test_row = next(r for r in records if r["event"] == "ci.test")
+    assert test_row["attributes"]["ci.selection.mode"] == "selected"
+    assert test_row["attributes"]["ci.merged_change.id"] == 41
+    assert optimizations  # imported for the module's side-effect-free API

@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 from .. import collector_identity
-from . import cgroup, export, junit, marks, platforms, record
+from . import cgroup, export, junit, marks, optimizations, platforms, record
 from .http import Deadline
 
 DEFAULT_BUDGET_SECONDS = 60.0
@@ -41,7 +41,11 @@ def _parser() -> argparse.ArgumentParser:
         default=[],
         help="name=hit outcome of a cache restore, e.g. uv=true; repeatable. Empty values are ignored.",
     )
-    report.add_argument("--outcome", help="The job's status so far (success/failure/cancelled), e.g. ${{ job.status }}.")
+    report.add_argument("--outcome", help="The job's status so far (success/failure/cancelled).")
+    report.add_argument("--selection", help="Test-selection record (default: selection.json in the state dir).")
+    report.add_argument("--workers-file", help="Per-worker record (default: workers.json in the state dir).")
+    report.add_argument("--workers", type=int, help="xdist worker count, when no workers file says it.")
+    report.add_argument("--quarantine", help="Quarantined test ids (default: quarantine.json in the state dir).")
     report.add_argument("--output", default="ci-health.json")
     report.add_argument("--no-export", action="store_true", help="Write the document only.")
     report.add_argument("--no-platform", action="store_true", help="Skip the platform adapter.")
@@ -109,6 +113,8 @@ def _identity(env: dict[str, str], platform: str | None) -> dict[str, Any]:
         "runner_os": env.get("RUNNER_OS"),
         "runner_arch": env.get("RUNNER_ARCH"),
         "url": url,
+        **optimizations.pr_linkage(env),
+        "merged_pr_number": None,
     }
 
 
@@ -200,8 +206,24 @@ def _report(args: argparse.Namespace, env: dict[str, str]) -> None:
     if not identity.get("revision") and env.get("MIRA_VITALS_CI_REVISION"):
         identity["revision"] = env["MIRA_VITALS_CI_REVISION"]
 
+    ident = _identity(env, (platform or {}).get("platform") or platform_name)
+    ident["merged_pr_number"] = ((platform or {}).get("run") or {}).get("merged_pr_number")
+    opts = {
+        "selection": optimizations.selection(
+            args.selection or optimizations.default_path(env, "selection.json"), warnings
+        ),
+        "parallelism": optimizations.workers(
+            args.workers_file or optimizations.default_path(env, "workers.json"), args.workers, warnings
+        ),
+    }
+    quarantined = optimizations.quarantine(
+        args.quarantine or optimizations.default_path(env, "quarantine.json"), warnings
+    )
+    for case in cases:
+        case["quarantined"] = junit.test_id(case) in quarantined
+
     doc = record.build(
-        identity=_identity(env, (platform or {}).get("platform") or platform_name),
+        identity=ident,
         platform=platform,
         platform_note=note,
         marks=all_marks,
@@ -213,6 +235,7 @@ def _report(args: argparse.Namespace, env: dict[str, str]) -> None:
         outcome=args.outcome,
         warnings=warnings,
         generated_by=identity,
+        optimizations=opts,
     )
 
     export_status: dict[str, Any] = {"metrics": "skipped", "logs": "skipped", "notes": ["--no-export"]}

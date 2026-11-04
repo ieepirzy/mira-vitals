@@ -44,6 +44,7 @@ def build(
     outcome: str | None,
     warnings: list[str],
     generated_by: dict[str, Any],
+    optimizations: dict[str, Any] | None = None,
     now: float | None = None,
 ) -> dict[str, Any]:
     now = time.time() if now is None else now
@@ -95,6 +96,7 @@ def build(
         "caches": caches,
         "runner": runner,
         "tests": {"files": test_files, "summary": tests_summary, "cases": tests},
+        "optimizations": optimizations or {"selection": None, "parallelism": None},
         "platform": platform,
         "platform_note": platform_note,
         "warnings": warnings,
@@ -185,6 +187,21 @@ def metric_points(doc: dict[str, Any]) -> list[dict[str, Any]]:
     add("ci.runner.memory.limit", "By", runner.get("memory_limit_bytes"))
     for name, hit in sorted(doc["caches"].items()):
         add("ci.cache.hit", "1", 1 if hit else 0, **{"ci.cache.name": name})
+    opts = doc.get("optimizations") or {}
+    sel = opts.get("selection")
+    if sel:
+        mode = {"ci.selection.mode": sel["mode"]}
+        add("ci.selection.tests.selected", "{test}", sel.get("selected"), **mode)
+        add("ci.selection.tests.total", "{test}", sel.get("total"), **mode)
+        add("ci.selection.saved.estimate", "s", sel.get("estimated_saved_seconds"), **mode)
+        add("ci.selection.closure_cache.hits", "{test}", sel.get("closure_cache_hits"), **mode)
+        for trigger in sel.get("triggers") or []:
+            add("ci.selection.full_trigger", "1", 1, **{"ci.selection.trigger": trigger})
+    par = opts.get("parallelism")
+    if par:
+        add("ci.xdist.workers", "{worker}", par.get("count"))
+        add("ci.xdist.worker.wall.max", "s", par.get("wall_max_seconds"))
+        add("ci.xdist.imbalance", "1", par.get("imbalance"))
     return points
 
 
@@ -199,6 +216,10 @@ def _identity_attrs(doc: dict[str, Any]) -> dict[str, Any]:
         "vcs.ref.head.name": ident.get("ref"),
         "cicd.pipeline.trigger": ident.get("event"),
         "ci.reporter.job": doc["job"].get("name"),
+        "ci.selection.mode": ((doc.get("optimizations") or {}).get("selection") or {}).get("mode"),
+        "vcs.change.id": ident.get("pr_number"),
+        "vcs.ref.base.revision": ident.get("base_sha"),
+        "ci.merged_change.id": ident.get("merged_pr_number"),
     }
 
 
@@ -226,6 +247,8 @@ def log_records(doc: dict[str, Any], *, max_tests: int) -> list[dict[str, Any]]:
             "ci.tests.summary": {k: v for k, v in summary.items() if k != "slowest"} or None,
             "ci.runner": doc["runner"] or None,
             "ci.caches": doc["caches"] or None,
+            "ci.selection": (doc.get("optimizations") or {}).get("selection"),
+            "ci.parallelism": (doc.get("optimizations") or {}).get("parallelism"),
             "ci.platform.note": doc["platform_note"],
             "ci.warnings": doc["warnings"] or None,
             "url.full": doc["identity"].get("url"),
@@ -306,6 +329,7 @@ def log_records(doc: dict[str, Any], *, max_tests: int) -> list[dict[str, Any]]:
                 "code.filepath": case.get("file") or None,
                 "test.case.result.status": case["outcome"],
                 "test.case.duration": case["duration_seconds"],
+                "test.case.quarantined": case.get("quarantined"),
             },
         )
     if len(ordered) > max_tests:

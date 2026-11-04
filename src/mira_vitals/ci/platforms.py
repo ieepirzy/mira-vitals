@@ -173,10 +173,22 @@ def _github(env: dict[str, str], token: str, deadline: Deadline) -> tuple[dict[s
                 "url": job.get("html_url"),
             }
         )
+    # On a push (a merge to the default branch), the PR that commit merged:
+    # the join key for escapes (a main failure the PR run did not catch).
+    merged_pr = None
+    if run.get("event") == "push" and run.get("head_sha"):
+        sha = urllib.parse.quote(str(run["head_sha"]), safe="")
+        api_repo = urllib.parse.quote(repo, safe="/")
+        status, pulls, _ = request("GET", f"{api}/repos/{api_repo}/commits/{sha}/pulls", headers=headers, deadline=deadline)
+        if status == 200 and isinstance(pulls, list):
+            merged = [p for p in pulls if isinstance(p, dict) and p.get("merged_at") and isinstance(p.get("number"), int)]
+            if merged:
+                merged_pr = merged[0]["number"]
     return (
         {
             "platform": "github",
             "run": {
+                "merged_pr_number": merged_pr,
                 "id": run.get("id"),
                 "attempt": run.get("run_attempt"),
                 "number": run.get("run_number"),
