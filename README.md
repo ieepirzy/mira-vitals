@@ -147,12 +147,38 @@ jobs:
     secrets: inherit
 ```
 
+## CI health
+
+The same tool measures the pipeline as well as the code: how long each job
+waited for a runner, how long it ran, which steps and tests took the time,
+cache hits, and whether the runner was CPU-throttled. It never fails the
+build, needs no webhook or org-level app (the job's own token is enough, on
+GitHub or Forgejo), and exports over standard OTLP.
+
+```yaml
+steps:
+  - uses: ieepirzy/mira-vitals/.github/actions/ci-health@<sha>
+    with: { mode: start }
+  # ... your steps; optionally `mira-vitals ci mark <phase> || true` between them
+  - uses: ieepirzy/mira-vitals/.github/actions/ci-health@<sha>
+    if: always()
+    with:
+      junit: reports/junit.xml
+      outcome: ${{ job.status }}
+```
+
+See [`docs/ci-health.md`](docs/ci-health.md) for what is measured, the
+ClickHouse schema and the queries (percentiles, queue wait by runner label,
+slowest steps and tests, flaky tests, critical path, cost, regressions).
+
 ## Documentation
 
 - [`docs/metrics.md`](docs/metrics.md) — every metric definition, the function
   set, the percentile method, and the cardinality rules
 - [`docs/provenance.md`](docs/provenance.md) — the authoring model and what it
   refuses to guess
+- [`docs/ci-health.md`](docs/ci-health.md) — CI health: measurements, signals,
+  ClickHouse schema and queries
 - [`docs/endpoint.md`](docs/endpoint.md) — the wire contract for the optional
   document sink
 

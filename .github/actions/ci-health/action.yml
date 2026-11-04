@@ -1,0 +1,142 @@
+name: mira-vitals CI health
+description: >-
+  Measure a CI job -- queue wait, wall time, steps, phases, per-test
+  durations, cache outcomes, runner CPU and memory -- write ci-health.json and
+  export it over OTLP. Never fails the build.
+
+# Usage, in any job (GitHub Actions, or Forgejo Actions with the full URL
+# `https://github.com/ieepirzy/mira-vitals/.github/actions/ci-health@<sha>`):
+#
+#   permissions:
+#     contents: read
+#     actions: read            # the platform adapter reads this run's jobs
+#   steps:
+#     - uses: ieepirzy/mira-vitals/.github/actions/ci-health@<sha>
+#       with: { mode: start }  # first step: the clock and a resource baseline
+#     ...
+#     - run: mira-vitals ci mark install || true     # optional phase marks
+#     ...
+#     - uses: ieepirzy/mira-vitals/.github/actions/ci-health@<sha>
+#       if: always()
+#       with:
+#         junit: reports/junit.xml
+#         caches: uv=${{ steps.uv.outputs.cache-hit }}
+#         outcome: ${{ job.status }}
+#       env:
+#         OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.CODE_HEALTH_TOKEN && 'https://collector.example' || '' }}
+#         OTEL_EXPORTER_OTLP_HEADERS: Authorization=Bearer%20${{ secrets.CODE_HEALTH_TOKEN }}
+#
+# Pin by commit SHA, as for measure.yml. The collector installed is this
+# action's own checkout (`github.action_path`), so the pin covers the code
+# that measures, with no second version to keep in step.
+#
+# Every step below ends in `exit 0` or `continue-on-error`: a missing Python,
+# a failed install or an unreachable endpoint becomes a warning, never a red
+# job. The `mira-vitals` command is put on PATH through a directory holding
+# only that one link -- never the venv's bin, whose `python` and `pip` would
+# shadow the job's own for every later step.
+
+inputs:
+  mode:
+    description: "start (first step) or report (last step, with if: always())."
+    default: report
+  junit:
+    description: "JUnit XML paths or globs, separated by spaces or newlines."
+    default: ""
+  caches:
+    description: "Cache outcomes as name=hit pairs, comma-separated, e.g. uv=true,npm=false. Empty values are ignored."
+    default: ""
+  outcome:
+    description: "The job's status so far; pass ${{ job.status }}."
+    default: ""
+  output:
+    description: "Where the ci-health.json document is written."
+    default: ci-health.json
+  token:
+    description: "Token for the platform adapter (needs actions: read). Empty skips it."
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - id: probe
+      shell: bash
+      run: |
+        set +e
+        dir="${RUNNER_TEMP:-/tmp}/mira-vitals-ci"
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+        if [ -x "$dir/bin/mira-vitals" ]; then
+          echo "installed=true" >> "$GITHUB_OUTPUT"; echo "need-uv=false" >> "$GITHUB_OUTPUT"; exit 0
+        fi
+        py=""
+        for c in python3.13 python3.12 python3.11 python3; do
+          if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys, venv; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+            py="$c"; break
+          fi
+        done
+        echo "python=$py" >> "$GITHUB_OUTPUT"
+        if [ -z "$py" ] && ! command -v uv >/dev/null 2>&1; then
+          echo "need-uv=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "need-uv=false" >> "$GITHUB_OUTPUT"
+        fi
+        exit 0
+
+    # Runners with neither a Python >= 3.11 nor uv (ARC's stock image): uv
+    # provisions an interpreter. v6.8.0, pinned by commit.
+    - if: steps.probe.outputs.need-uv == 'true'
+      uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+      continue-on-error: true
+      with:
+        enable-cache: false
+
+    - shell: bash
+      env:
+        MV_DIR: ${{ steps.probe.outputs.dir }}
+        MV_PY: ${{ steps.probe.outputs.python }}
+        MV_INSTALLED: ${{ steps.probe.outputs.installed }}
+        MV_SRC: ${{ github.action_path }}/../../..
+      run: |
+        set +e
+        if [ "$MV_INSTALLED" != "true" ]; then
+          mkdir -p "$MV_DIR/bin"
+          if [ -n "$MV_PY" ]; then
+            "$MV_PY" -m venv "$MV_DIR/venv" \
+              && "$MV_DIR/venv/bin/pip" install -q --disable-pip-version-check "$MV_SRC"
+          elif command -v uv >/dev/null 2>&1; then
+            uv venv -q --python 3.12 "$MV_DIR/venv" \
+              && uv pip install -q --python "$MV_DIR/venv/bin/python" "$MV_SRC"
+          fi
+          if [ -x "$MV_DIR/venv/bin/mira-vitals" ]; then
+            ln -sf "$MV_DIR/venv/bin/mira-vitals" "$MV_DIR/bin/mira-vitals"
+          else
+            echo "::warning title=mira-vitals ci::could not install the collector; this job is not measured"
+          fi
+        fi
+        [ -x "$MV_DIR/bin/mira-vitals" ] && echo "$MV_DIR/bin" >> "$GITHUB_PATH"
+        exit 0
+
+    - shell: bash
+      env:
+        MV_DIR: ${{ steps.probe.outputs.dir }}
+        MV_MODE: ${{ inputs.mode }}
+        MV_JUNIT: ${{ inputs.junit }}
+        MV_CACHES: ${{ inputs.caches }}
+        MV_OUTCOME: ${{ inputs.outcome }}
+        MV_OUTPUT: ${{ inputs.output }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+        MIRA_VITALS_CI_REVISION: ${{ github.action_ref }}
+      run: |
+        set +e
+        bin="$MV_DIR/bin/mira-vitals"
+        [ -x "$bin" ] || exit 0
+        if [ "$MV_MODE" = "start" ]; then
+          "$bin" ci start
+          exit 0
+        fi
+        args=(ci report --output "$MV_OUTPUT")
+        for pattern in $MV_JUNIT; do args+=(--junit "$pattern"); done
+        [ -n "$MV_CACHES" ] && args+=(--cache "$MV_CACHES")
+        [ -n "$MV_OUTCOME" ] && args+=(--outcome "$MV_OUTCOME")
+        "$bin" "${args[@]}"
+        exit 0
