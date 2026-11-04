@@ -370,4 +370,12 @@ def run() -> None:
     """
     import sys
 
+    # `mira-vitals ci ...` is the CI-health command (mira_vitals.ci). It has
+    # the opposite exit policy from the code-health run below -- it never
+    # fails a build -- so it is dispatched before any of this module's
+    # argument parsing can reject its arguments.
+    if len(sys.argv) > 1 and sys.argv[1] == "ci":
+        from .ci.command import main as ci_main
+
+        sys.exit(ci_main(sys.argv[2:]))
     sys.exit(main())
