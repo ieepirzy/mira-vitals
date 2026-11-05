@@ -931,3 +931,100 @@ def test_report_records_node_pod_and_average_cores(env, tmp_path):
     assert doc["runner"]["cpu_avg_cores"] > 0
     attrs = record.log_records(doc, max_tests=0)[0]["attributes"]
     assert attrs["k8s.node.name"] == "muutto365-ci-abc" and attrs["k8s.pod.name"] == "runner-pod-1"
+
+
+# --- a private receiver's own CA (OTEL_EXPORTER_OTLP_CERTIFICATE) -------------
+
+def _ca_and_leaf(tmp_path, name):
+    """A throwaway CA and a 127.0.0.1 leaf it signed, with the openssl CLI."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("openssl"):
+        pytest.skip("openssl CLI not available")
+    d = tmp_path / name
+    d.mkdir()
+
+    def run(*args):
+        subprocess.run(["openssl", *args], check=True, capture_output=True, timeout=30)
+
+    run("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-days", "2",
+        "-subj", f"/CN={name} CA", "-keyout", str(d / "ca.key"), "-out", str(d / "ca.crt"),
+        "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign")
+    run("req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-subj", "/CN=127.0.0.1",
+        "-keyout", str(d / "leaf.key"), "-out", str(d / "leaf.csr"))
+    (d / "ext").write_text("subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n")
+    run("x509", "-req", "-in", str(d / "leaf.csr"), "-CA", str(d / "ca.crt"), "-CAkey", str(d / "ca.key"),
+        "-CAcreateserial", "-days", "2", "-extfile", str(d / "ext"), "-out", str(d / "leaf.crt"))
+    return d
+
+
+def _tls_server(d):
+    import ssl
+
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            seen.append((self.path, dict(self.headers), self.rfile.read(length)))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(d / "leaf.crt", d / "leaf.key")
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"https://127.0.0.1:{server.server_address[1]}", seen
+
+
+def test_a_pinned_ca_is_trusted_alone_and_never_falls_back(tmp_path):
+    from mira_vitals.ci.http import request
+
+    good = _ca_and_leaf(tmp_path, "receiver")
+    other = _ca_and_leaf(tmp_path, "other")
+    server, url, seen = _tls_server(good)
+    auth = {"Authorization": "Bearer secret-token"}
+    try:
+        ok = request("POST", url + "/v1/logs", headers=auth, body={}, deadline=Deadline(10), cafile=str(good / "ca.crt"))
+        wrong = request("POST", url + "/v1/logs", headers=auth, body={}, deadline=Deadline(10), cafile=str(other / "ca.crt"))
+        roots = request("POST", url + "/v1/logs", headers=auth, body={}, deadline=Deadline(10))
+        missing = request("POST", url + "/v1/logs", headers=auth, body={}, deadline=Deadline(10),
+                          cafile=str(tmp_path / "absent.pem"))
+    finally:
+        server.shutdown()
+    assert ok[0] == 200 and ok[2] is None
+    # Another CA, the system roots, or an unreadable file: no request at all
+    # reaches the server, and nothing raises.
+    for status, _, error in (wrong, roots, missing):
+        assert status is None and error
+    assert "unusable" in missing[2] and "secret-token" not in missing[2]
+    assert len(seen) == 1
+    # A CA for a plain-http endpoint is a configuration error, not a downgrade.
+    status, _, error = request("POST", "http://127.0.0.1:9/x", body={}, deadline=Deadline(5), cafile=str(good / "ca.crt"))
+    assert status is None and "non-https" in error
+
+
+def test_export_reads_the_standard_certificate_variables(tmp_path):
+    from mira_vitals.ci.export import certificate, send
+
+    d = _ca_and_leaf(tmp_path, "receiver")
+    server, url, seen = _tls_server(d)
+    env = {"OTEL_EXPORTER_OTLP_ENDPOINT": url, "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer%20t",
+           "OTEL_EXPORTER_OTLP_CERTIFICATE": str(d / "ca.crt")}
+    try:
+        status = send(env, metrics_body={"resourceMetrics": []}, logs_bodies=[{"resourceLogs": []}], deadline=Deadline(10))
+    finally:
+        server.shutdown()
+    assert status["metrics"] == "ok" and status["logs"] == "ok", status
+    assert [p for p, _, _ in seen] == ["/v1/metrics", "/v1/logs"]
+    # The per-signal variable wins over the general one.
+    assert certificate({"OTEL_EXPORTER_OTLP_CERTIFICATE": "a", "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE": "b"}, "logs") == "b"
+    assert certificate({"OTEL_EXPORTER_OTLP_CERTIFICATE": "a"}, "metrics") == "a"
+    assert certificate({}, "logs") is None
