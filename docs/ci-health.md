@@ -493,7 +493,10 @@ SELECT
     repository, workflow, run_id, run_attempt,
     any(sha)                                                         AS sha,
     any(event)                                                       AS event,
-    toUnixTimestamp64Milli(assumeNotNull(coalesce(min(trigger_at), min(run_created_at), min(created_at)))) / 1000 AS trigger_s,
+    -- NULL when no time is known at all, so the verdicts are NULL (left out
+    -- of p50/p90) rather than measured from epoch 0.
+    if(isNull(coalesce(min(trigger_at), min(run_created_at), min(created_at))), NULL,
+       toUnixTimestamp64Milli(assumeNotNull(coalesce(min(trigger_at), min(run_created_at), min(created_at)))) / 1000) AS trigger_s,
     countIf(completed_at IS NULL) = 0                                AS complete,
     countIf(conclusion = 'failure') > 0                              AS red,
     if(complete, toUnixTimestamp64Milli(assumeNotNull(max(completed_at))) / 1000 - trigger_s, NULL) AS time_to_verdict_s,
@@ -523,7 +526,10 @@ SELECT
     repository, sha,
     groupUniqArray(workflow)                                         AS workflows,
     any(event)                                                       AS event,
-    toUnixTimestamp64Milli(assumeNotNull(coalesce(min(trigger_at), min(run_created_at), min(created_at)))) / 1000 AS trigger_s,
+    -- NULL when no time is known at all, so the verdicts are NULL (left out
+    -- of p50/p90) rather than measured from epoch 0.
+    if(isNull(coalesce(min(trigger_at), min(run_created_at), min(created_at))), NULL,
+       toUnixTimestamp64Milli(assumeNotNull(coalesce(min(trigger_at), min(run_created_at), min(created_at)))) / 1000) AS trigger_s,
     countIf(completed_at IS NULL) = 0                                AS complete,
     countIf(conclusion = 'failure') > 0                              AS red,
     if(complete, toUnixTimestamp64Milli(assumeNotNull(max(completed_at))) / 1000 - trigger_s, NULL) AS time_to_verdict_s,
