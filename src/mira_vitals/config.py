@@ -82,6 +82,10 @@ class Config:
     #: would be exactly the coupling it exists to avoid.
     provenance_agent_sources: list[dict[str, Any]] = field(default_factory=list)
 
+    #: `mira-vitals ci select` settings (the `[select]` table); see
+    #: `ci/select.py` and docs/ci-select.md.
+    select: dict[str, Any] = field(default_factory=dict)
+
     @property
     def effective_lint_paths(self) -> list[str]:
         return self.lint_paths or self.paths

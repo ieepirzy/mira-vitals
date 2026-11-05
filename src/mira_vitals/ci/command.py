@@ -22,6 +22,7 @@ from .http import Deadline
 
 DEFAULT_BUDGET_SECONDS = 60.0
 DEFAULT_MAX_TESTS = 20000
+DEFAULT_SELECT_BUDGET_SECONDS = 600.0
 
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f\u2028\u2029\u0085]")
@@ -76,7 +77,54 @@ def _parser() -> argparse.ArgumentParser:
     report.add_argument("--max-tests", type=int, default=DEFAULT_MAX_TESTS, help="Cap on exported ci.test records.")
     report.add_argument("--budget", type=float, default=DEFAULT_BUDGET_SECONDS, help="Seconds for the whole report.")
     report.add_argument("--quiet", action="store_true")
+    sel = sub.add_parser("select", help="Which test files this change needs (writes selection.json).")
+    sel.add_argument("--base", required=True, help="Base revision (the PR's base SHA).")
+    sel.add_argument("--head", required=True, help="Head revision (the checked-out SHA).")
+    sel.add_argument("--repo", default=".", help="Project root inside the checkout.")
+    sel.add_argument("--mode", choices=["advisory", "enforce"], help="Overrides select.policy.")
+    sel.add_argument("--event", help="The triggering event (default: GITHUB_EVENT_NAME).")
+    sel.add_argument("--output", help="selection.json path (default: the state dir).")
+    sel.add_argument("--args-out", help="Test files to run, one per line; empty means the whole suite.")
+    sel.add_argument("--budget", type=float, default=DEFAULT_SELECT_BUDGET_SECONDS)
     return parser
+
+
+def _select_table(repo: str) -> dict[str, Any] | None:
+    """The `[select]` table from the repository's mira-vitals configuration."""
+    from .. import config as cfg
+
+    for filename, keys in cfg.CONFIG_SOURCES:
+        table = cfg._read_table(os.path.join(repo, filename), keys)
+        if table is not None:
+            section = table.get("select")
+            return section if isinstance(section, dict) else None
+    return None
+
+
+def _select(args: argparse.Namespace, env: dict[str, str]) -> None:
+    from . import select as selector
+
+    if not args.event:
+        args.event = env.get("GITHUB_EVENT_NAME") or env.get("GITEA_EVENT_NAME")
+    output = args.output or optimizations.default_path(env, "selection.json")
+    try:
+        table = _select_table(args.repo)
+    except Exception as exc:  # noqa: BLE001 - a bad config is a full run
+        table = {"policy": f"invalid config: {exc}"[:200]}
+    doc = selector.main_select(args, env, table)
+    try:
+        selector.write_outputs(doc, output, args.args_out)
+    except OSError as exc:
+        # No args file means the caller runs the whole suite: still safe.
+        _warn(f"could not write the selection: {exc}")
+    verdict = (
+        f"{doc['decision']} ({', '.join(doc['triggers'])})"
+        if doc["triggers"]
+        else f"{doc['decision']}: {doc.get('selected')} of {doc.get('total')} test files"
+    )
+    print(f"mira-vitals ci select: policy {doc['policy']}, decision {verdict}, ran {doc['mode']}")
+    for err in doc.get("errors") or []:
+        _warn(f"select: {err}")
 
 
 def _baseline_path(env: dict[str, str]) -> str:
@@ -242,8 +290,11 @@ def _summary_markdown(doc: dict[str, Any], export_status: dict[str, Any]) -> str
     sel = opts.get("selection")
     if sel:
         lines.append(
-            f"- Test selection: {sel['mode']}, {sel.get('selected')} of {sel.get('total')} tests"
-            + (f"; full because {', '.join(sel['triggers'])}" if sel.get("triggers") else "")
+            f"- Test selection ({_cell(sel.get('policy') or 'n/a', 12)}): ran {sel['mode']}, "
+            f"selector chose {_cell(sel.get('decision') or sel['mode'], 12)}, {sel.get('selected')} of "
+            f"{sel.get('total')} {_cell(sel.get('count_unit') or 'tests', 8)}"
+            + (f"; full because {_cell(', '.join(sel['triggers']), 120)}" if sel.get("triggers") else "")
+            + (f"; **{sel['escapes']} escape(s)**" if sel.get("escapes") else "")
         )
     steps = sorted(
         (st for st in job.get("steps") or [] if st.get("duration_seconds") is not None),
@@ -330,6 +381,26 @@ def _report(args: argparse.Namespace, env: dict[str, str]) -> None:
     )
     for case in cases:
         case["quarantined"] = junit.test_id(case) in quarantined
+    sel_opts = opts.get("selection")
+    if sel_opts is not None and sel_opts.get("skipped_files") is not None:
+        # An escape: a test the selector would have skipped (advisory) or did
+        # skip, that failed. In advisory mode every test ran, so this is the
+        # direct proof a selection would have been unsafe.
+        skipped = set(sel_opts["skipped_files"])
+        escaped = sorted(
+            {
+                junit.test_id(c)
+                for c in cases
+                if c.get("outcome") in ("failed", "error") and junit.test_id(c).split("::", 1)[0] in skipped
+            }
+        )
+        sel_opts["escapes"] = len(escaped)
+        sel_opts["escape_ids"] = escaped[:50]
+        sel_opts["skipped"] = len(skipped)
+    if sel_opts is not None:
+        # The file list served the escape check; the exported record keeps
+        # the count, not up to 5,000 paths.
+        sel_opts.pop("skipped_files", None)
 
     doc = record.build(
         identity=ident,
@@ -427,8 +498,10 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
             marks.record(args.name, env=env)
         elif args.command == "report":
             _report(args, env)
+        elif args.command == "select":
+            _select(args, env)
         else:
-            _warn("usage: mira-vitals ci start | mark <name> | report")
+            _warn("usage: mira-vitals ci start | mark <name> | report | select")
     except _OutOfTime:
         _warn(f"{args.command} ran out of its {budget:.0f} s budget; stopped, nothing more measured")
     except Exception as exc:  # noqa: BLE001 - the contract: never fail the build
