@@ -123,7 +123,12 @@ def test_workflow_shape():
     body = text.split("\non:\n", 1)[1]
     assert body.startswith("  workflow_call:\n"), "callable only, never triggered by paths"
     assert "\n  push:" not in body and "\n  pull_request:" not in body and "paths:" not in body
-    assert "default: '\"ubuntu-latest\"'" in text
+    # runs-on is required with no default: never GitHub-hosted by accident.
+    inputs = body.split("    inputs:\n", 1)[1].split("\npermissions:", 1)[0]
+    runs_on = inputs.split("      runs-on:\n", 1)[1].split("\n      ", 0)[0]
+    assert "required: true" in runs_on.split("\n\n")[0]
+    assert "default:" not in inputs.split("      runs-on:\n", 1)[1]
+    assert "ubuntu-latest" not in text and "windows-" not in text and "macos-" not in text
     assert "\npermissions: {}\n" in text
     assert "runs-on: ${{ fromJSON(inputs.runs-on) }}" in text
     assert "timeout-minutes: 5" in text

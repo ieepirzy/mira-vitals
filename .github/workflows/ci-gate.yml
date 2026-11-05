@@ -29,14 +29,15 @@
 #     with:
 #       needs: ${{ toJSON(needs) }}
 #       required: '{"tofu": ${{ needs.changes.outputs.tofu }}, ...}'
-#       runs-on: '"mira-ci"'        # optional; default GitHub-hosted
+#       runs-on: '"mira-ci"'        # required: the caller's own runner
 #
 # Never put trigger-level `paths:` on a workflow whose checks a merge waits on.
 #
-# runs-on: JSON, as fromJSON takes it (a label string or a list). The default is
-# GitHub-hosted, which costs a public caller nothing. A private caller is billed
-# at least one hosted minute per gate job, so a high-volume private repository
-# should pass its self-hosted label instead.
+# runs-on: JSON, as fromJSON takes it (a label string or a list). Required, no
+# default: our repositories run on self-hosted runners only, because GitHub's
+# hosted minutes can't sustain them and cost more (Ilari, 2026-11-05); a gate
+# that silently landed on hosted minutes could exhaust the quota and stall
+# every merge. A caller that forgets it fails at call time, loudly.
 name: CI gate
 
 on:
@@ -51,10 +52,9 @@ on:
         required: true
         type: string
       runs-on:
-        description: JSON runs-on value (a label string or list).
-        required: false
+        description: JSON runs-on value (a label string or list), e.g. '"mira-ci"'.
+        required: true
         type: string
-        default: '"ubuntu-latest"'
 
 permissions: {}
 
