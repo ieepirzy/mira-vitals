@@ -574,7 +574,9 @@ def test_report_carries_selection_workers_quarantine_and_merged_pr(env, tmp_path
     assert doc["optimizations"]["selection"]["selected"] == 5
     assert doc["optimizations"]["parallelism"]["count"] == 4
     assert "Parallelism: 4 xdist workers" in command._summary_markdown(doc, {"metrics": "x", "logs": "x"})
-    assert "Test selection: selected, 5 of 20 tests" in command._summary_markdown(doc, {"metrics": "x", "logs": "x"})
+    assert "Test selection (n/a): ran selected, selector chose selected, 5 of 20 tests" in command._summary_markdown(
+        doc, {"metrics": "x", "logs": "x"}
+    )
     assert doc["identity"]["merged_pr_number"] == 41
     broken = next(c for c in doc["tests"]["cases"] if c["name"] == "test_broken")
     assert broken["quarantined"] is True

@@ -25,8 +25,9 @@ Producers write small JSON files into the job's state directory (or pass
 paths with ``--selection`` / ``--workers`` / ``--quarantine``); ``ci report``
 reads them. Each file is optional, read defensively, and a bad file is a
 warning, never a failure. The file contracts are below and in
-``docs/ci-health.md``; the coming ``mira-vitals ci select`` writes
-``selection.json`` itself.
+``docs/ci-health.md``; ``mira-vitals ci select`` (``docs/ci-select.md``)
+writes ``selection.json`` itself, adding ``policy``, ``decision``,
+``count_unit`` and ``skipped_files``, from which ``ci report`` counts escapes.
 
 ``selection.json``::
 
@@ -69,6 +70,11 @@ KNOWN_TRIGGERS = (
     "non-py",
     "deleted-py",
     "conftest-closure",
+    "docker",
+    "unresolved",
+    "unknown-change",
+    "unsafe-path",
+    "selector_error",
 )
 _IDENT = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,47}$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$")
@@ -140,7 +146,24 @@ def selection(path: str | None, warnings: list[str]) -> dict[str, Any] | None:
         "ruff_version": _version(graph.get("ruff_version")),
         "lomitus_version": _version(graph.get("lomitus_version")),
         "closure_cache_hits": _num(raw.get("closure_cache_hits"), integer=True),
+        # From `mira-vitals ci select`: the policy (advisory runs everything
+        # and only records), the selector's own decision, the unit of the
+        # counts, and the files it would skip -- read by `ci report` to count
+        # escapes, then dropped (see command._report).
+        "policy": raw.get("policy") if raw.get("policy") in ("advisory", "enforce") else None,
+        "decision": raw.get("decision") if raw.get("decision") in ("full", "selected") else None,
+        "count_unit": raw.get("count_unit") if raw.get("count_unit") in ("tests", "files") else None,
+        "skipped_files": _paths(raw.get("skipped_files")),
     }
+
+
+_PATH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]{0,300}$")
+
+
+def _paths(value: Any) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    return [v for v in value[:5000] if isinstance(v, str) and _PATH.match(v)]
 
 
 def workers(path: str | None, declared: int | None, warnings: list[str]) -> dict[str, Any] | None:

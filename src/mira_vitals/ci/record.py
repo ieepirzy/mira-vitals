@@ -211,6 +211,7 @@ def metric_points(doc: dict[str, Any]) -> list[dict[str, Any]]:
         add("ci.selection.tests.total", "{test}", sel.get("total"), **mode)
         add("ci.selection.saved.estimate", "s", sel.get("estimated_saved_seconds"), **mode)
         add("ci.selection.closure_cache.hits", "{test}", sel.get("closure_cache_hits"), **mode)
+        add("ci.selection.escapes", "{test}", sel.get("escapes"), **mode)
         for trigger in sel.get("triggers") or []:
             add("ci.selection.full_trigger", "1", 1, **{"ci.selection.trigger": trigger})
     par = opts.get("parallelism")
