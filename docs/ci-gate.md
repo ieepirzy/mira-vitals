@@ -46,7 +46,7 @@ jobs:
     with:
       needs: ${{ toJSON(needs) }}
       required: '{"tofu": ${{ needs.changes.outputs.tofu }}}'
-      runs-on: '"mira-ci"'   # optional
+      runs-on: '"mira-ci"'   # required
 ```
 
 - **Push to main:** make `changes` output `true` for everything, so main always
@@ -59,8 +59,4 @@ jobs:
 
 ## `runs-on`
 
-The default is GitHub-hosted (`ubuntu-latest`), which is free for public
-repositories. A **private** caller is billed at least one hosted minute per
-gate run. On a high-volume private repository that is thousands of minutes a
-month, so pass the self-hosted label instead. The cost is one more queue hop
-after the last job.
+Required, with no default. Our repositories run on self-hosted runners only: GitHub's hosted minutes can't sustain them and cost more than our own runners (Ilari, 2026-11-05). A gate on hosted minutes could exhaust the quota and stall every merge, so a caller that omits `runs-on` fails loudly instead.
