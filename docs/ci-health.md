@@ -112,8 +112,13 @@ key (below), keeping the newest.
 ## Export
 
 Standard OpenTelemetry variables only: `OTEL_EXPORTER_OTLP_ENDPOINT` (or the
-per-signal `…_METRICS_ENDPOINT` / `…_LOGS_ENDPOINT`) and
-`OTEL_EXPORTER_OTLP_HEADERS`. JSON over HTTP, gzipped. Unset endpoint:
+per-signal `…_METRICS_ENDPOINT` / `…_LOGS_ENDPOINT`),
+`OTEL_EXPORTER_OTLP_HEADERS`, and `OTEL_EXPORTER_OTLP_CERTIFICATE` (or
+`…_METRICS_CERTIFICATE` / `…_LOGS_CERTIFICATE`): a PEM file of the CA that
+signed a private receiver's certificate, trusted alone for that request. An
+unreadable file means that signal is not sent, never a fallback to the
+system roots. A credential still goes over https only. JSON over HTTP,
+gzipped. Unset endpoint:
 export skipped, document still written. The receiver's `partialSuccess`
 counts are reported, so a receiver that does not yet store `ci.*` records
 says so in the job summary instead of dropping them silently.

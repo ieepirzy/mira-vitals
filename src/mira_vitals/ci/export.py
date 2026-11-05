@@ -9,7 +9,11 @@ gateway in front of the central ClickHouse later without a producer change:
 * ``OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`` / ``..._LOGS_ENDPOINT`` -- full
   per-signal URLs, used as-is when set;
 * ``OTEL_EXPORTER_OTLP_HEADERS`` -- ``key=value`` pairs, comma-separated,
-  values percent-encoded (e.g. ``Authorization=Bearer%20<token>``).
+  values percent-encoded (e.g. ``Authorization=Bearer%20<token>``);
+* ``OTEL_EXPORTER_OTLP_CERTIFICATE`` / ``..._METRICS_CERTIFICATE`` /
+  ``..._LOGS_CERTIFICATE`` -- a PEM file of the CA to verify the endpoint
+  against, alone (a private receiver's own CA). Unreadable: that signal is
+  not sent; never a fallback to the system roots.
 
 Unset endpoint: nothing is sent and the report says "export skipped". Not
 an error -- the document is on disk either way.
@@ -46,6 +50,10 @@ def endpoint(env: dict[str, str], signal: str) -> str | None:
     return base.rstrip("/") + f"/v1/{signal}"
 
 
+def certificate(env: dict[str, str], signal: str) -> str | None:
+    return env.get(f"OTEL_EXPORTER_OTLP_{signal.upper()}_CERTIFICATE") or env.get("OTEL_EXPORTER_OTLP_CERTIFICATE") or None
+
+
 def _partial(body: Any, field: str) -> int:
     if not isinstance(body, dict):
         return 0
@@ -74,7 +82,8 @@ def send(
         return status
     if metrics_url:
         code, body, error = request(
-            "POST", metrics_url, headers=headers, body=metrics_body, deadline=deadline, gzip_body=True
+            "POST", metrics_url, headers=headers, body=metrics_body, deadline=deadline, gzip_body=True,
+            cafile=certificate(env, "metrics"),
         )
         if code is not None and 200 <= code < 300:
             rejected = _partial(body, "rejectedDataPoints")
@@ -86,7 +95,8 @@ def send(
         sent, rejected, failures = 0, 0, 0
         for body_out in logs_bodies:
             code, body, error = request(
-                "POST", logs_url, headers=headers, body=body_out, deadline=deadline, gzip_body=True
+                "POST", logs_url, headers=headers, body=body_out, deadline=deadline, gzip_body=True,
+                cafile=certificate(env, "logs"),
             )
             if code is not None and 200 <= code < 300:
                 sent += 1
