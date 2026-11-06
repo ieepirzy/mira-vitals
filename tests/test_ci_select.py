@@ -125,6 +125,102 @@ def test_bad_config_is_rejected():
             Settings.from_table(bad)
 
 
+def test_change_categories_overlap_and_renames_count_once_per_category():
+    counts = select.classify_changes([
+        Change("modified", ".github/workflows/ci.yml"),
+        Change("modified", "migrations/001.py"),
+        Change("modified", "tests/test_api.py"),
+        Change("renamed", "web/main.ts", "web/old.ts"),
+        Change("modified", "package.json"),
+        Change("modified", "src/api.py"),
+        Change("modified", "README.md"),
+        Change("modified", "assets/logo.svg"),
+    ])
+    assert counts == {"application": 1, "ci": 1, "dependencies": 1, "documentation": 1,
+                      "frontend": 1, "migrations": 1, "other": 1, "tests": 1}
+    assert select.classify_changes([]) == {}
+    assert select.classify_changes([Change("renamed", "tests/test_a.py", "src/a.py")]) == {
+        "application": 1, "tests": 1,
+    }
+
+
+def test_selection_config_hash_tracks_effective_policy_and_settings_without_cache_secrets():
+    original = Settings()
+    same = Settings.from_table({})
+    baseline = select.selection_config_hash(original, "advisory")
+    assert baseline.startswith("sha256:") and len(baseline) == 71
+    assert baseline == select.selection_config_hash(same, "advisory")
+    assert baseline != select.selection_config_hash(same, "enforce")
+    same.always_run.append("tests/test_critical.py")
+    assert baseline != select.selection_config_hash(same, "advisory")
+    same = Settings()
+    same.cache_env = ["SECRET_TOKEN"]
+    same.service_images = ["https://user:password@example.invalid/image"]
+    assert baseline == select.selection_config_hash(same, "advisory")
+
+
+def test_selector_keeps_known_change_categories_if_graph_fails(repo, monkeypatch):
+    r, base, head = repo
+    monkeypatch.setattr(select, "ruff_graph", lambda *_: (_ for _ in ()).throw(RuntimeError("failed graph")))
+    doc = select.run(str(r), base, head, Settings(graph_sources=["ruff"]))
+    assert doc["triggers"] == ["selector_error"]
+    assert doc["changed_files"] == 1
+    assert doc["change_categories"] == ["application"]
+    assert doc["change_category_counts"] == {"application": 1}
+    assert doc["selector_duration_seconds"] >= 0
+    assert doc["skipped_files_complete"] is False
+
+
+def test_selector_unknown_change_categories_if_diff_fails(repo):
+    r, _base, head = repo
+    doc = select.run(str(r), "invalid-revision", head, Settings(graph_sources=["ruff"]))
+    assert doc["changed_files"] is None
+    assert doc["change_categories"] is None
+    assert doc["change_category_counts"] is None
+    assert doc["selector_duration_seconds"] >= 0
+
+
+def test_path_triggers_remain_visible_when_graph_fails(monkeypatch):
+    monkeypatch.setattr(select, "changed", lambda *_: [Change("modified", "migrations/065.sql")])
+    monkeypatch.setattr(select, "tracked_files", lambda *_: ["tests/test_a.py"])
+    monkeypatch.setattr(select, "ruff_graph", lambda *_: (_ for _ in ()).throw(RuntimeError("failed graph")))
+    doc = select.run(".", "base", "head", Settings(graph_sources=["ruff"]))
+    assert doc["triggers"] == ["migrations", "non-py", "selector_error"]
+    assert doc["triggers_complete"] is False
+    assert doc["change_category_counts"] == {"migrations": 1}
+
+
+def test_enforce_falls_back_to_full_when_selection_list_exceeds_bound(monkeypatch):
+    files = [f"tests/test_{i}.py" for i in range(5001)]
+    monkeypatch.setattr(select, "changed", lambda *_: [Change("modified", "src/a.py")])
+    monkeypatch.setattr(select, "tracked_files", lambda *_: files)
+    monkeypatch.setattr(select, "ruff_graph", lambda *_: {"src/a.py": [], **{f: ["src/a.py"] for f in files}})
+    doc = select.run(".", "base", "head", Settings(graph_sources=["ruff"]), policy="enforce", event="pull_request")
+    assert doc["triggers"] == ["unsafe-output-size"]
+    assert doc["decision"] == "full" and doc["mode"] == "full"
+    assert doc["run_files"] == []
+    assert doc["run_files_complete"] is True
+
+
+def test_advisory_marks_truncated_skip_list_as_incomplete(monkeypatch):
+    files = [f"tests/test_{i}.py" for i in range(5001)]
+    monkeypatch.setattr(select, "changed", lambda *_: [Change("modified", "src/a.py")])
+    monkeypatch.setattr(select, "tracked_files", lambda *_: files)
+    monkeypatch.setattr(select, "ruff_graph", lambda *_: {"src/a.py": [], **{f: [] for f in files}})
+    doc = select.run(".", "base", "head", Settings(graph_sources=["ruff"]), policy="advisory", event="pull_request")
+    assert doc["decision"] == "selected" and doc["mode"] == "full"
+    assert len(doc["skipped_files"]) == 5000
+    assert doc["skipped_files_complete"] is False
+
+
+def test_empty_selected_argument_file_is_reported_as_full(monkeypatch):
+    monkeypatch.setattr(select, "changed", lambda *_: [Change("modified", "src/a.py")])
+    monkeypatch.setattr(select, "tracked_files", lambda *_: ["tests/test_b.py"])
+    monkeypatch.setattr(select, "ruff_graph", lambda *_: {"src/a.py": [], "tests/test_b.py": []})
+    doc = select.run(".", "base", "head", Settings(graph_sources=["ruff"]), policy="enforce", event="pull_request")
+    assert doc["decision"] == "selected" and doc["mode"] == "full" and doc["run_files"] == []
+
+
 # -- a real repository: modes and fail-open -------------------------------------
 
 needs_tools = pytest.mark.skipif(shutil.which("git") is None or shutil.which("ruff") is None, reason="git and ruff")
@@ -257,7 +353,7 @@ def test_report_counts_an_advisory_escape(tmp_path):
     out = tmp_path / "ci-health.json"
     env = {"MIRA_VITALS_CI_DIR": str(state), "PATH": os.environ["PATH"]}
     rc = command.main(
-        ["report", "--junit", str(junit_xml), "--output", str(out), "--no-export", "--no-platform", "--quiet"], env=env
+        ["report", "--junit", str(junit_xml), "--tests-complete", "--output", str(out), "--no-export", "--no-platform", "--quiet"], env=env
     )
     assert rc == 0
     sel = json.loads(out.read_text())["optimizations"]["selection"]
@@ -269,17 +365,115 @@ def test_report_counts_no_escape_when_the_failure_was_selected(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
     (state / "selection.json").write_text(
-        json.dumps({"mode": "full", "policy": "advisory", "decision": "selected", "skipped_files": ["tests/test_b.py"]})
+        json.dumps({"mode": "full", "policy": "advisory", "decision": "selected", "selected": 1, "total": 2,
+                    "skipped_files": ["tests/test_b.py"]})
     )
     junit_xml = tmp_path / "junit.xml"
     junit_xml.write_text(
         '<testsuites><testsuite name="pytest">'
         '<testcase classname="tests.test_a" name="test_f" time="0.1"><failure message="x"/></testcase>'
+        '<testcase classname="tests.test_b" name="test_g" time="0.1"/>'
         "</testsuite></testsuites>"
     )
     out = tmp_path / "ci-health.json"
     command.main(
-        ["report", "--junit", str(junit_xml), "--output", str(out), "--no-export", "--no-platform", "--quiet"],
+        ["report", "--junit", str(junit_xml), "--tests-complete", "--output", str(out), "--no-export", "--no-platform", "--quiet"],
         env={"MIRA_VITALS_CI_DIR": str(state)},
     )
     assert json.loads(out.read_text())["optimizations"]["selection"]["escapes"] == 0
+
+
+@pytest.mark.parametrize("condition", ["no_junit", "invalid_junit", "missing_file", "truncated", "cancelled"])
+def test_report_does_not_claim_zero_escapes_without_complete_evidence(tmp_path, condition):
+    state = tmp_path / "state"
+    state.mkdir()
+    selection = {"mode": "full", "policy": "advisory", "decision": "selected", "selected": 1, "total": 2,
+                 "skipped_files": ["tests/test_b.py"], "skipped_files_complete": condition != "truncated"}
+    (state / "selection.json").write_text(json.dumps(selection))
+    junit_xml = tmp_path / "junit.xml"
+    if condition == "invalid_junit":
+        junit_xml.write_text("not XML")
+    else:
+        classname = "tests.test_a" if condition == "missing_file" else "tests.test_b"
+        junit_xml.write_text(f'<testsuite><testcase classname="{classname}" name="test_g"/></testsuite>')
+    out = tmp_path / "ci-health.json"
+    args = ["report", "--tests-complete", "--output", str(out), "--no-export", "--no-platform", "--quiet"]
+    if condition != "no_junit":
+        args += ["--junit", str(junit_xml)]
+    if condition == "cancelled":
+        args += ["--outcome", "cancelled"]
+    assert command.main(args, env={"MIRA_VITALS_CI_DIR": str(state)}) == 0
+    sel = json.loads(out.read_text())["optimizations"]["selection"]
+    assert sel["escapes"] is None
+    assert sel["escape_observation"] == "incomplete"
+
+
+def test_full_selection_is_not_a_zero_escape_trial(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "selection.json").write_text(json.dumps({
+        "mode": "full", "decision": "full", "selected": 2, "total": 2, "skipped_files": [],
+    }))
+    out = tmp_path / "ci-health.json"
+    command.main(["report", "--output", str(out), "--no-export", "--no-platform", "--quiet"],
+                 env={"MIRA_VITALS_CI_DIR": str(state)})
+    sel = json.loads(out.read_text())["optimizations"]["selection"]
+    assert sel["escapes"] is None and sel["escape_observation"] == "not_applicable"
+
+
+@pytest.mark.parametrize("time_attr, outcome, expected", [
+    ('time="2.5"', "success", 2.5), ("", "success", None),
+    ('time="NaN"', "success", None), ('time="2.5"', None, None),
+])
+def test_skipped_test_seconds_are_observed_not_assumed(tmp_path, time_attr, outcome, expected):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "selection.json").write_text(json.dumps({
+        "mode": "full", "policy": "advisory", "decision": "selected", "selected": 1, "total": 2,
+        "skipped_files": ["tests/test_b.py"], "skipped_files_complete": True,
+    }))
+    xml = tmp_path / "junit.xml"
+    xml.write_text(f'<testsuite><testcase classname="tests.test_b" name="test_g" {time_attr}/></testsuite>')
+    out = tmp_path / "ci-health.json"
+    args = ["report", "--tests-complete", "--output", str(out), "--junit", str(xml), "--no-export", "--no-platform", "--quiet"]
+    if outcome:
+        args += ["--outcome", outcome]
+    command.main(args, env={"MIRA_VITALS_CI_DIR": str(state)})
+    sel = json.loads(out.read_text())["optimizations"]["selection"]
+    assert sel["escape_observation"] == "complete"
+    assert sel["skipped_test_seconds_observed"] == expected
+
+
+def test_missing_one_of_multiple_junit_reports_is_incomplete(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "selection.json").write_text(json.dumps({
+        "mode": "full", "decision": "selected", "selected": 1, "total": 2,
+        "skipped_files": ["tests/test_b.py"],
+    }))
+    xml = tmp_path / "junit.xml"
+    xml.write_text('<testsuite><testcase classname="tests.test_b" name="test_g" time="1"/></testsuite>')
+    out = tmp_path / "ci-health.json"
+    command.main(["report", "--tests-complete", "--output", str(out), "--junit", str(xml), "--junit", str(tmp_path / "missing.xml"),
+                  "--no-export", "--no-platform", "--quiet"], env={"MIRA_VITALS_CI_DIR": str(state)})
+    sel = json.loads(out.read_text())["optimizations"]["selection"]
+    assert sel["escapes"] is None and sel["escape_observation"] == "incomplete"
+
+
+def test_without_attestation_positive_failure_is_only_a_lower_bound(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "selection.json").write_text(json.dumps({
+        "mode": "full", "decision": "selected", "selected": 1, "total": 2,
+        "skipped_files": ["tests/test_b.py"],
+    }))
+    xml = tmp_path / "junit.xml"
+    xml.write_text('<testsuite><testcase classname="tests.test_b" name="test_g" time="1"><failure/></testcase></testsuite>')
+    out = tmp_path / "ci-health.json"
+    command.main(["report", "--output", str(out), "--junit", str(xml), "--outcome", "success",
+                  "--no-export", "--no-platform", "--quiet"], env={"MIRA_VITALS_CI_DIR": str(state)})
+    sel = json.loads(out.read_text())["optimizations"]["selection"]
+    assert sel["tests_complete_attested"] is False
+    assert sel["escape_observation"] == "incomplete" and sel["escapes"] is None
+    assert sel["escapes_observed"] == 1 and sel["escape_ids_observed"] == ["tests/test_b.py::test_g"]
+    assert sel["skipped_test_seconds_observed"] is None

@@ -11,6 +11,7 @@ time is spread evenly, and only the per-test distribution tells them apart.
 from __future__ import annotations
 
 import glob
+import math
 import os
 import xml.etree.ElementTree as ET  # noqa: S405 - our own CI's report, size-capped below
 from typing import Any
@@ -41,7 +42,17 @@ def _seconds(value: str | None) -> float:
         number = float(value.replace(",", ""))
     except ValueError:
         return 0.0
-    return number if number >= 0 and number == number else 0.0  # NaN-safe
+    return number if number >= 0 and math.isfinite(number) else 0.0
+
+
+def _time_measured(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        number = float(value.replace(",", ""))
+    except ValueError:
+        return False
+    return math.isfinite(number) and number >= 0
 
 
 def parse_file(path: str) -> list[dict[str, Any]]:
@@ -59,6 +70,7 @@ def parse_file(path: str) -> list[dict[str, Any]]:
                 "name": case.get("name") or "",
                 "file": case.get("file") or "",
                 "duration_seconds": round(_seconds(case.get("time")), 6),
+                "duration_measured": _time_measured(case.get("time")),
                 "outcome": _outcome(case),
             }
         )

@@ -24,6 +24,28 @@ DEFAULT_BUDGET_SECONDS = 60.0
 DEFAULT_MAX_TESTS = 20000
 DEFAULT_SELECT_BUDGET_SECONDS = 600.0
 
+# Explicit job annotations, not guesses from job names. Keep the vocabulary
+# bounded: it is suitable for aggregation without exporting user input.
+WORK_CATEGORIES = frozenset({"unit-test", "integration-test", "e2e-test", "lint", "typecheck",
+                             "image-build", "security-scan", "dependency-scan", "migration",
+                             "deploy-validation", "test-selection", "other"})
+WORK_OUTCOMES = frozenset({"success", "failure", "skipped", "cancelled", "unknown"})
+
+
+def _work(pairs: list[str], warnings: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for pair in pairs:
+        category, sep, outcome = pair.partition("=")
+        if not sep or category not in WORK_CATEGORIES or outcome not in WORK_OUTCOMES:
+            warnings.append("invalid work category or outcome; ignored")
+            continue
+        if category in result and result[category] != outcome:
+            warnings.append(f"conflicting work outcomes for {category}; recorded as unknown")
+            result[category] = "unknown"
+        else:
+            result[category] = outcome
+    return result
+
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f\u2028\u2029\u0085]")
 
@@ -67,6 +89,9 @@ def _parser() -> argparse.ArgumentParser:
         help="name=hit outcome of a cache restore, e.g. uv=true; repeatable. Empty values are ignored.",
     )
     report.add_argument("--outcome", help="The job's status so far (success/failure/cancelled).")
+    report.add_argument("--work", action="append", default=[], metavar="CATEGORY=OUTCOME",
+                        help="Explicit job work outcome; repeat for each category actually observed.")
+    report.add_argument("--tests-complete", action="store_true", help="Caller attests all intended test lanes finished and their JUnit reports were collected.")
     report.add_argument("--selection", help="Test-selection record (default: selection.json in the state dir).")
     report.add_argument("--workers-file", help="Per-worker record (default: workers.json in the state dir).")
     report.add_argument("--workers", type=int, help="xdist worker count, when no workers file says it.")
@@ -86,7 +111,36 @@ def _parser() -> argparse.ArgumentParser:
     sel.add_argument("--output", help="selection.json path (default: the state dir).")
     sel.add_argument("--args-out", help="Test files to run, one per line; empty means the whole suite.")
     sel.add_argument("--budget", type=float, default=DEFAULT_SELECT_BUDGET_SECONDS)
+    opp = sub.add_parser("opportunity", help="Summarize local CI-health JSON documents.")
+    opp.add_argument("reports", nargs="+", help="Report files or quoted glob patterns.")
+    opp.add_argument("--output", help="Output JSON file (default: stdout).")
     return parser
+
+
+def _opportunity(args: argparse.Namespace) -> None:
+    from . import opportunity
+
+    paths = junit.expand(args.reports)
+    docs: list[dict[str, Any]] = []
+    unreadable = 0
+    for path in paths:
+        try:
+            if os.path.getsize(path) > 64 * 1024 * 1024:
+                raise ValueError("report too large")
+            with open(path, encoding="utf-8") as handle:
+                docs.append(json.load(handle))
+        except (OSError, ValueError):
+            unreadable += 1
+    result = opportunity.aggregate(docs)
+    result["input_files"] = len(paths)
+    result["unreadable_files"] = unreadable
+    result["unmatched_patterns"] = sum(not junit.expand([pattern]) for pattern in args.reports)
+    payload = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+    else:
+        print(payload, end="")
 
 
 def _select_table(repo: str) -> dict[str, Any] | None:
@@ -279,6 +333,8 @@ def _summary_markdown(doc: dict[str, Any], export_status: dict[str, Any]) -> str
         lines.append(f"- Node: {_cell(node, 80)}")
     if doc["caches"]:
         lines.append("- Caches: " + ", ".join(f"{k} {'hit' if v else 'miss'}" for k, v in sorted(doc["caches"].items())))
+    if doc.get("work"):
+        lines.append("- Work (caller-reported): " + ", ".join(f"{k}: {v}" for k, v in sorted(doc["work"].items())))
     opts = doc.get("optimizations") or {}
     par = opts.get("parallelism")
     if par:
@@ -382,22 +438,59 @@ def _report(args: argparse.Namespace, env: dict[str, str]) -> None:
     for case in cases:
         case["quarantined"] = junit.test_id(case) in quarantined
     sel_opts = opts.get("selection")
-    if sel_opts is not None and sel_opts.get("skipped_files") is not None:
-        # An escape: a test the selector would have skipped (advisory) or did
-        # skip, that failed. In advisory mode every test ran, so this is the
-        # direct proof a selection would have been unsafe.
-        skipped = set(sel_opts["skipped_files"])
-        escaped = sorted(
-            {
-                junit.test_id(c)
-                for c in cases
-                if c.get("outcome") in ("failed", "error") and junit.test_id(c).split("::", 1)[0] in skipped
-            }
-        )
-        sel_opts["escapes"] = len(escaped)
-        sel_opts["escape_ids"] = escaped[:50]
-        sel_opts["skipped"] = len(skipped)
     if sel_opts is not None:
+        paths = sel_opts.get("skipped_files")
+        complete = sel_opts.get("skipped_files_complete") is True and paths is not None
+        skipped = set(paths or [])
+        sel_opts["skipped"] = len(skipped) if complete else None
+        sel_opts["escapes"] = None
+        sel_opts["escape_ids"] = None
+        sel_opts["escapes_observed"] = None
+        sel_opts["escape_ids_observed"] = None
+        sel_opts["tests_complete_attested"] = args.tests_complete
+        sel_opts["skipped_test_seconds_observed"] = None
+        decision = sel_opts.get("decision")
+        # Failures in the available subset are useful even if the caller
+        # cannot attest all lanes ran. They are a lower bound, never a zero.
+        observed = sorted({junit.test_id(c) for c in cases
+                           if c.get("outcome") in ("failed", "error")
+                           and junit.test_id(c).split("::", 1)[0] in skipped})
+        if observed:
+            sel_opts["escapes_observed"] = len(observed)
+            sel_opts["escape_ids_observed"] = observed[:50]
+        if decision == "full" or (decision == "selected" and complete and not skipped):
+            # No file was tested as a candidate for exclusion.
+            sel_opts["escape_observation"] = "not_applicable"
+        elif decision != "selected" or sel_opts.get("mode") != "full":
+            # Enforced selection cannot observe failures in skipped files.
+            sel_opts["escape_observation"] = "unavailable"
+        else:
+            # A partial/missing test report, or an incomplete skipped-file
+            # list, cannot prove a zero-escape outcome. Each skipped file must
+            # be represented by at least one testcase for a complete reading.
+            skipped_cases = [c for c in cases if junit.test_id(c).split("::", 1)[0] in skipped]
+            represented = {junit.test_id(c).split("::", 1)[0] for c in skipped_cases if c.get("outcome") != "skipped"}
+            all_reports_found = bool(args.junit) and all(junit.expand([pattern]) for pattern in args.junit)
+            if (not args.tests_complete or not complete or not files or problems or not all_reports_found
+                    or args.outcome == "cancelled"
+                    or any(c.get("outcome") == "skipped" for c in skipped_cases)
+                    or not skipped.issubset(represented)):
+                sel_opts["escape_observation"] = "incomplete"
+            else:
+                escaped = sorted({junit.test_id(c) for c in cases
+                                  if c.get("outcome") in ("failed", "error")
+                                  and junit.test_id(c).split("::", 1)[0] in skipped})
+                sel_opts["escapes"] = len(escaped)
+                sel_opts["escape_ids"] = escaped[:50]
+                sel_opts["escapes_observed"] = len(escaped)
+                sel_opts["escape_ids_observed"] = escaped[:50]
+                sel_opts["escape_observation"] = "complete"
+                # Sum only observed test durations, not estimated runner or
+                # verdict savings; parallelism and queueing are separate.
+                if args.outcome in ("success", "failure") and all(c.get("duration_measured") for c in skipped_cases):
+                    sel_opts["skipped_test_seconds_observed"] = round(
+                        sum(c["duration_seconds"] for c in skipped_cases), 6
+                    )
         # The file list served the escape check; the exported record keeps
         # the count, not up to 5,000 paths.
         sel_opts.pop("skipped_files", None)
@@ -418,6 +511,8 @@ def _report(args: argparse.Namespace, env: dict[str, str]) -> None:
         optimizations=opts,
         max_cases=max(0, args.max_tests),
     )
+    # Empty means the job did not report categories, not that it did no work.
+    doc["work"] = _work(args.work, warnings) or None
 
     export_status: dict[str, Any] = {"metrics": "skipped", "logs": "skipped", "notes": ["--no-export"]}
     if not args.no_export:
@@ -500,6 +595,8 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
             _report(args, env)
         elif args.command == "select":
             _select(args, env)
+        elif args.command == "opportunity":
+            _opportunity(args)
         else:
             _warn("usage: mira-vitals ci start | mark <name> | report | select")
     except _OutOfTime:

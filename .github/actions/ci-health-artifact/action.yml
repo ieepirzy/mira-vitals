@@ -1,0 +1,40 @@
+name: Upload CI health PR observation
+description: Upload a bounded report for import by a separate trusted workflow.
+inputs:
+  report:
+    description: Path to ci-health.json produced by the report action.
+    default: ci-health.json
+runs:
+  using: composite
+  steps:
+    - id: prepare
+      if: ${{ github.event_name == 'pull_request' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        MV_OUTPUT: ${{ inputs.report }}
+        MV_DIR: ${{ runner.temp }}
+      run: |
+        python3 -P - <<'PY'
+        import json, os, shutil
+        output = os.environ['MV_OUTPUT']
+        if os.path.getsize(output) > 16 * 1024 * 1024:
+            raise ValueError('report too large')
+        with open(output, encoding='utf-8') as f:
+            report = json.load(f)
+        job_id = report.get('job', {}).get('id')
+        if type(job_id) is not int or job_id <= 0:
+            raise ValueError('missing numeric GitHub job id')
+        target = os.path.join(os.environ['MV_DIR'], 'mira-vitals-artifact', str(job_id))
+        os.makedirs(target, exist_ok=True)
+        shutil.copyfile(output, os.path.join(target, 'ci-health.json'))
+        with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+            f.write(f'id={job_id}\npath={target}/ci-health.json\n')
+        PY
+    - if: ${{ always() && steps.prepare.outcome == 'success' && steps.prepare.outputs.id != '' }}
+      continue-on-error: true
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: mira-vitals-ci-${{ steps.prepare.outputs.id }}
+        path: ${{ steps.prepare.outputs.path }}
+        if-no-files-found: warn

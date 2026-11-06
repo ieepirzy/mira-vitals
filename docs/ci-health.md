@@ -44,6 +44,18 @@ or, in a workflow, the composite action
 | Runner CPU used, CPU throttled, CPU limit | cgroup v2 | Throttling is the "slow suite" that is really a CPU quota. Delta against the `start` baseline. |
 | Runner memory peak and limit | cgroup v2 | `memory.peak` vs `memory.max`. |
 | Outcome, attempt, run identity | environment | `run_attempt > 1` is a rerun. |
+| Work performed | `--work category=outcome` or action `work` input | Explicit caller-reported outcomes; missing means not reported, not no work. |
+
+Jobs can report their work using repeated `--work unit-test=success` flags,
+or the action input `work: unit-test=success,security-scan=skipped`. Supply
+each value from the relevant step's outcome, not from what the workflow
+intended to run. Accepted categories are `unit-test`, `integration-test`,
+`e2e-test`, `lint`, `typecheck`, `image-build`, `security-scan`,
+`dependency-scan`, `migration`, `deploy-validation`, `test-selection`, and
+`other`; outcomes are `success`, `failure`, `skipped`, `cancelled`, and
+`unknown`. Conflicting reports become `unknown`; unrecognized input is
+ignored with a warning. The `work` document field and `ci.work` log attribute
+are absent/null when nothing was reported. No user-defined labels are exported.
 
 `None` everywhere means *not measured*, never zero.
 
