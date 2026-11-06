@@ -155,6 +155,8 @@ def test_pr_upload_and_trusted_import_are_separate():
     assert "repository: ieepirzy/mira-vitals" in trusted
     assert "persist-credentials: false" in trusted
     assert "github.event.workflow_run.head" not in trusted
+    assert "OTEL_EXPORTER_OTLP_CA_PEM" in trusted
+    assert "OTEL_EXPORTER_OTLP_CERTIFICATE=%s" in trusted
 
 
 def test_self_measure_does_not_forward_ingest_credentials_to_pr_code():

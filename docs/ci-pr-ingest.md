@@ -49,9 +49,10 @@ jobs:
       collector-sha: <reviewed-40-hex-sha>
       upstream-workflow-path: .github/workflows/ci.yml
       runner: mira-ci
-      otlp-endpoint: https://collector.example
+      otlp-endpoint: https://ci-health-ingest.observability.svc.cluster.local:4318
     secrets:
-      OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+      OTEL_EXPORTER_OTLP_HEADERS: ${{ format('Authorization=Bearer%20{0}', secrets.CODE_HEALTH_TOKEN) }}
+      OTEL_EXPORTER_OTLP_CA_PEM: ${{ secrets.CODE_HEALTH_CA }}
 ```
 
 The importer checks that the event is a completed PR `workflow_run`; retrieves
@@ -62,6 +63,9 @@ out the separately pinned public collector, never PR code. It downloads each
 archive through GitHub, with an HTTPS storage-host allowlist and **without**
 forwarding the GitHub token to the redirected host. Archives are never
 extracted to disk: each must contain exactly one bounded `ci-health.json`.
+The optional CA secret is written to a temporary file for the OTLP exporter;
+when supplied it is trusted alone. Omit it only for a collector whose TLS
+certificate is verified by the runner's normal trust store.
 
 All imported values are still **untrusted PR observations**. Code in the PR
 can change or forge its own report, including the test-completion attestation.
