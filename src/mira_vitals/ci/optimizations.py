@@ -54,6 +54,7 @@ writes ``selection.json`` itself, adding ``policy``, ``decision``,
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from typing import Any
@@ -98,7 +99,13 @@ def _load(path: str | None, warnings: list[str], what: str) -> Any:
 def _num(value: Any, *, integer: bool = False) -> float | int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if value != value or value < 0:  # NaN or negative
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        return None
+    if not finite or value < 0:
+        return None
+    if integer and int(value) != value:
         return None
     return int(value) if integer else float(value)
 
@@ -134,6 +141,24 @@ def selection(path: str | None, warnings: list[str]) -> dict[str, Any] | None:
     if selected is not None and total is not None and selected > total:
         warnings.append("selection says more tests selected than exist; counts ignored")
         selected = total = None
+    paths = _paths(raw.get("skipped_files"))
+    paths_valid = (isinstance(raw.get("skipped_files"), list) and paths is not None
+                   and len(paths) == len(raw["skipped_files"]) and len(set(paths)) == len(paths))
+    declared_complete = raw.get("skipped_files_complete")
+    count_matches = selected is not None and total is not None and paths_valid and len(paths) == total - selected
+    if raw.get("skipped_files") is None:
+        paths_complete = None
+    elif declared_complete is False or not paths_valid:
+        paths_complete = False
+    elif declared_complete is True:
+        # A completeness assertion cannot override inconsistent counts.
+        paths_complete = count_matches if selected is not None and total is not None else None
+    else:
+        # Older producers did not report truncation. Infer only from counts.
+        paths_complete = count_matches if selected is not None and total is not None else None
+
+    categories = _categories(raw.get("change_categories"))
+    category_counts = _category_counts(raw.get("change_category_counts"))
     return {
         "mode": mode,
         "triggers": sorted(set(triggers)),
@@ -153,11 +178,36 @@ def selection(path: str | None, warnings: list[str]) -> dict[str, Any] | None:
         "policy": raw.get("policy") if raw.get("policy") in ("advisory", "enforce") else None,
         "decision": raw.get("decision") if raw.get("decision") in ("full", "selected") else None,
         "count_unit": raw.get("count_unit") if raw.get("count_unit") in ("tests", "files") else None,
-        "skipped_files": _paths(raw.get("skipped_files")),
+        "skipped_files": paths,
+        "skipped_files_complete": paths_complete,
+        "run_files_complete": raw.get("run_files_complete") if isinstance(raw.get("run_files_complete"), bool) else None,
+        "triggers_complete": raw.get("triggers_complete") if isinstance(raw.get("triggers_complete"), bool) else None,
+        "changed_files": _num(raw.get("changed_files"), integer=True),
+        "change_categories": categories,
+        "change_category_counts": category_counts,
+        "selector_duration_seconds": _num(raw.get("selector_duration_seconds")),
+        "selection_config_hash": _selection_config_hash(raw.get("selection_config_hash")),
     }
 
 
 _PATH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]{0,300}$")
+_CATEGORIES = frozenset({"application", "tests", "migrations", "dependencies", "ci", "frontend", "documentation", "other"})
+
+
+def _selection_config_hash(value: Any) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(r"sha256:[a-f0-9]{64}", value) else None
+
+
+def _categories(value: Any) -> list[str] | None:
+    if not isinstance(value, list) or any(not isinstance(v, str) or v not in _CATEGORIES for v in value):
+        return None
+    return sorted(set(value))
+
+
+def _category_counts(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict) or any(k not in _CATEGORIES or _num(v, integer=True) is None for k, v in value.items()):
+        return None
+    return {k: int(v) for k, v in value.items()}
 
 
 def _paths(value: Any) -> list[str] | None:

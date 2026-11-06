@@ -41,6 +41,7 @@ import platform as _platform
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -158,6 +159,72 @@ class Change:
     status: str  # added | modified | deleted | renamed | other
     path: str
     old_path: str | None = None
+
+
+# A small, stable vocabulary: categories are intentionally allowed to overlap.
+# These are observations about paths, not dependency or safety conclusions.
+# Never export file names in this summary. Changes outside these patterns are
+# classified as ``other`` rather than silently disappearing.
+_CATEGORY_GLOBS: dict[str, tuple[str, ...]] = {
+    "tests": ("tests/**", "test/**", "**/tests/**", "**/test/**", "**/test_*.py", "**/*_test.py",
+              "**/*.test.*", "**/*.spec.*", "**/conftest.py"),
+    "migrations": ("**/migrations/**", "**/alembic/**", "**/alembic.ini"),
+    "dependencies": ("**/pyproject.toml", "**/uv.lock", "**/requirements*.txt", "**/requirements*.in",
+                     "**/setup.py", "**/setup.cfg", "**/poetry.lock", "**/Pipfile*", "**/package.json",
+                     "**/package-lock.json", "**/pnpm-lock.yaml", "**/yarn.lock", "**/Cargo.toml", "**/Cargo.lock",
+                     "**/go.mod", "**/go.sum"),
+    "ci": (".github/**", "ci/**", "**/.gitlab-ci.yml", "**/Jenkinsfile", "mira-vitals.toml"),
+    "frontend": ("**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", "**/*.ts", "**/*.tsx", "**/*.vue",
+                 "**/*.html", "**/*.css", "**/*.scss", "**/*.sass"),
+    "documentation": ("**/*.md", "**/*.rst", "**/*.mdx", "**/LICENSE*"),
+}
+
+
+def classify_changes(changes: list[Change]) -> dict[str, int]:
+    """Count changed files by overlapping, bounded categories.
+
+    Both sides of a rename contribute their categories, but a renamed file is
+    counted at most once per category. An empty diff yields an empty mapping;
+    a failed diff is represented by ``None`` by the caller.
+    """
+    counts: dict[str, int] = {}
+    for change in changes:
+        paths = [change.path] + ([change.old_path] if change.old_path else [])
+        categories = {
+            name for name, patterns in _CATEGORY_GLOBS.items()
+            if any(matches(path, patterns) for path in paths)
+        }
+        if any(path.endswith(".py") and not matches(path, _CATEGORY_GLOBS["tests"])
+               and not matches(path, _CATEGORY_GLOBS["migrations"])
+               and not matches(path, _CATEGORY_GLOBS["ci"]) for path in paths):
+            categories.add("application")
+        if not categories:
+            categories.add("other")
+        for name in categories:
+            counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def selection_config_hash(settings: Settings, policy: str) -> str:
+    """Stable fingerprint of the effective non-secret selection settings.
+
+    Cache environment values, service URLs and closure-hash inputs do not
+    control which tests are selected and must never enter this fingerprint.
+    Prefix/version the contract so future changes to the input set are not
+    mixed with this one. The raw configuration is not exported.
+    """
+    config = {
+        "version": 1,
+        "policy": policy,
+        "trigger_globs": settings.trigger_globs,
+        "ignore_globs": settings.ignore_globs,
+        "test_globs": settings.test_globs,
+        "always_run": settings.always_run,
+        "graph_sources": settings.graph_sources,
+        "ruff_paths": settings.ruff_paths,
+    }
+    encoded = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def _git(args: list[str], cwd: str) -> str:
@@ -355,6 +422,7 @@ def run(
 ) -> dict[str, Any]:
     """Compute ``selection.json``. Never raises: any error is a full run with
     trigger ``selector_error`` (and the message in ``errors``)."""
+    started = time.monotonic()
     env = dict(os.environ) if env is None else env
     policy = policy or settings.policy
     doc: dict[str, Any] = {
@@ -364,11 +432,20 @@ def run(
         "head": head,
         "count_unit": "files",
         "selector": {"name": SELECTOR_NAME, "version": _selector_version(env)},
+        "selection_config_hash": selection_config_hash(settings, policy),
         "graph": {"source": "+".join(settings.graph_sources)},
         "errors": [],
+        "changed_files": None,
+        "change_categories": None,
+        "change_category_counts": None,
     }
+    changes: list[Change] | None = None
     try:
         changes = changed(repo, base, head)
+        counts = classify_changes(changes)
+        doc["changed_files"] = len(changes)
+        doc["change_categories"] = sorted(counts)
+        doc["change_category_counts"] = counts
         all_files = tracked_files(repo)
         test_files = [f for f in all_files if f.endswith(".py") and matches(f, settings.test_globs)]
         graph = None
@@ -380,18 +457,27 @@ def run(
             lomitus_files, lomitus_version = lomitus_affected(repo, base, head)
             doc["graph"]["lomitus_version"] = lomitus_version
         result = decide(settings, changes, test_files, graph, lomitus_files)
-        doc["changed_files"] = len(changes)
     except Exception as exc:  # noqa: BLE001 - fail open: the run is full
         doc["errors"].append(f"{type(exc).__name__}: {str(exc)[:300]}")
-        result = {"triggers": ["selector_error"], "selected": [], "tests": []}
+        # Preserve known path-based reasons even when a graph tool fails.
+        # Graph-dependent reasons are unknown, not asserted absent.
+        known_triggers = decide(settings, changes, [], None, None)["triggers"] if changes is not None else []
+        result = {"triggers": sorted({*known_triggers, "selector_error"}), "selected": [], "tests": []}
         test_files = []
 
-    triggers = result["triggers"]
+    triggers = list(result["triggers"])
+    # The argument-file contract is one path per line. Never turn an
+    # incomplete list into a smaller test run when the list exceeds the
+    # telemetry bound: a full suite is the only safe fallback.
+    if (not triggers and policy == "enforce" and event == "pull_request"
+            and len(result["selected"]) > MAX_LISTED_FILES):
+        triggers.append("unsafe-output-size")
     decision = "full" if triggers else "selected"
     tests = result["tests"]
     selected = result["selected"] if decision == "selected" else tests
     skipped = sorted(set(tests) - set(selected)) if decision == "selected" else []
-    ran_selection = decision == "selected" and policy == "enforce" and event == "pull_request"
+    # An empty args file means the caller runs the full suite, not zero tests.
+    ran_selection = bool(selected) and decision == "selected" and policy == "enforce" and event == "pull_request"
     doc.update(
         {
             # `mode` is what ran (the CI-health contract); `decision` is what
@@ -399,10 +485,15 @@ def run(
             "mode": "selected" if ran_selection else "full",
             "decision": decision,
             "triggers": triggers,
+            # A graph failure can leave some triggers unknown, even though
+            # known path triggers are retained above.
+            "triggers_complete": not doc["errors"],
             "selected": len(selected) if tests else None,
             "total": len(tests) if tests else None,
             "skipped_files": skipped[:MAX_LISTED_FILES],
             "run_files": selected[:MAX_LISTED_FILES] if ran_selection else [],
+            "skipped_files_complete": not doc["errors"] and len(skipped) <= MAX_LISTED_FILES,
+            "run_files_complete": not doc["errors"],
         }
     )
     if settings.record_closure_hashes and test_files and not doc["errors"]:
@@ -413,6 +504,7 @@ def run(
             }
         except Exception as exc:  # noqa: BLE001 - recording only
             doc["errors"].append(f"closure hashes: {type(exc).__name__}: {str(exc)[:200]}")
+    doc["selector_duration_seconds"] = max(0.0, time.monotonic() - started)
     return doc
 
 
@@ -446,14 +538,22 @@ def main_select(argv_ns: Any, env: dict[str, str], table: dict[str, Any] | None)
             "mode": "full",
             "decision": "full",
             "triggers": ["selector_error"],
+            "triggers_complete": False,
             "selected": None,
             "total": None,
             "count_unit": "files",
             "skipped_files": [],
             "run_files": [],
+            "skipped_files_complete": False,
+            "run_files_complete": False,
             "selector": {"name": SELECTOR_NAME, "version": _selector_version(env)},
+            "selection_config_hash": None,
             "graph": {"source": "none"},
             "errors": [f"config: {exc}"],
+            "changed_files": None,
+            "change_categories": None,
+            "change_category_counts": None,
+            "selector_duration_seconds": None,
         }
         return doc
     return run(argv_ns.repo, argv_ns.base, argv_ns.head, settings, policy=argv_ns.mode, event=argv_ns.event, env=env)

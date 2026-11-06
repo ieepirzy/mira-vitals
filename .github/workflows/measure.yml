@@ -12,8 +12,8 @@ name: Code health (reusable)
 #       with:
 #         gate: true
 #       secrets:
-#         OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
-#         CODE_HEALTH_TOKEN: ${{ secrets.CODE_HEALTH_TOKEN }}
+#         OTEL_EXPORTER_OTLP_HEADERS: ${{ github.event_name == 'push' && secrets.OTEL_EXPORTER_OTLP_HEADERS || '' }}
+#         CODE_HEALTH_TOKEN: ${{ github.event_name == 'push' && secrets.CODE_HEALTH_TOKEN || '' }}
 #
 # A commit SHA, not `@main`: `uses:` on a mutable ref executes whatever that
 # branch holds at run time, inside the consumer's runner and with the

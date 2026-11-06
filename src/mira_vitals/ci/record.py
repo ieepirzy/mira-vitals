@@ -268,6 +268,9 @@ def log_records(doc: dict[str, Any], *, max_tests: int) -> list[dict[str, Any]]:
             "ci.tests.summary": {k: v for k, v in summary.items() if k != "slowest"} or None,
             "ci.runner": doc["runner"] or None,
             "ci.caches": doc["caches"] or None,
+            "ci.work": doc.get("work"),
+            # Provenance, not a claim that a job's inputs or code are trusted.
+            "ci.observation.trust": "direct_job",
             "ci.selection": (doc.get("optimizations") or {}).get("selection"),
             "ci.parallelism": (doc.get("optimizations") or {}).get("parallelism"),
             "ci.platform.note": doc["platform_note"],

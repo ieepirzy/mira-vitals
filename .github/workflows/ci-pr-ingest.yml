@@ -1,0 +1,71 @@
+name: CI health PR report importer (reusable)
+
+# The caller must itself be triggered by workflow_run.completed and pass an
+# exact permitted upstream workflow path and an immutable collector SHA.
+# This workflow never checks out the upstream PR or executes its artifacts.
+on:
+  workflow_call:
+    inputs:
+      collector-sha:
+        type: string
+        required: true
+      upstream-workflow-path:
+        type: string
+        required: true
+      runner:
+        type: string
+        required: true
+      otlp-endpoint:
+        type: string
+        required: true
+    secrets:
+      OTEL_EXPORTER_OTLP_HEADERS:
+        required: true
+      OTEL_EXPORTER_OTLP_CA_PEM:
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  import:
+    if: github.event_name == 'workflow_run' && github.event.action == 'completed'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    steps:
+      - name: Validate the immutable collector reference
+        shell: bash
+        env:
+          COLLECTOR_SHA: ${{ inputs.collector-sha }}
+        run: '[[ "$COLLECTOR_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Checkout trusted collector only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ieepirzy/mira-vitals
+          ref: ${{ inputs.collector-sha }}
+          path: collector
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Configure collector CA when supplied
+        shell: bash
+        env:
+          MV_CA_PEM: ${{ secrets.OTEL_EXPORTER_OTLP_CA_PEM }}
+        run: |
+          if [ -n "$MV_CA_PEM" ]; then
+            umask 077
+            ca_path="$RUNNER_TEMP/mira-vitals-collector-ca.pem"
+            printf '%s\n' "$MV_CA_PEM" > "$ca_path"
+            printf 'OTEL_EXPORTER_OTLP_CERTIFICATE=%s\n' "$ca_path" >> "$GITHUB_ENV"
+          fi
+      - name: Import bounded PR observations
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MIRA_VITALS_ALLOWED_WORKFLOW: ${{ inputs.upstream-workflow-path }}
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ inputs.otlp-endpoint }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+        run: PYTHONPATH="$GITHUB_WORKSPACE/collector/src" python3 -P -m mira_vitals.ci.pr_ingest

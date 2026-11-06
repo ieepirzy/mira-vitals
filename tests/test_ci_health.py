@@ -518,6 +518,28 @@ def test_selection_record_is_validated(tmp_path):
     assert optimizations.selection(str(path), warnings) is None and warnings
 
 
+def test_selection_opportunity_fields_are_bounded_and_preserve_unknown(tmp_path):
+    from mira_vitals.ci import optimizations
+
+    path = tmp_path / "selection.json"
+    path.write_text(json.dumps({"mode": "full", "changed_files": 3, "change_categories": ["ci", "tests"],
+                                "change_category_counts": {"ci": 1, "tests": 2},
+                                "selector_duration_seconds": 1.25, "selected": 1, "total": 3,
+                                "skipped_files": ["tests/test_a.py", "tests/test_b.py"]}))
+    got = optimizations.selection(str(path), [])
+    assert got["change_categories"] == ["ci", "tests"]
+    assert got["change_category_counts"] == {"ci": 1, "tests": 2}
+    assert got["changed_files"] == 3 and got["selector_duration_seconds"] == 1.25
+    assert got["skipped_files_complete"] is True  # legacy, proven by matching counts
+    path.write_text(json.dumps({"mode": "full", "changed_files": -1, "change_categories": ["unbounded"],
+                                "change_category_counts": {"ci": 0.5}, "selector_duration_seconds": -1,
+                                "selected": 1, "total": 4, "skipped_files": ["tests/test_a.py"]}))
+    got = optimizations.selection(str(path), [])
+    assert got["changed_files"] is None and got["change_categories"] is None
+    assert got["change_category_counts"] is None and got["selector_duration_seconds"] is None
+    assert got["skipped_files_complete"] is False
+
+
 def test_worker_imbalance_and_isolation(tmp_path):
     from mira_vitals.ci import optimizations
 

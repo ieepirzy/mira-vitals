@@ -25,8 +25,8 @@ description: >-
 #         caches: uv=${{ steps.uv.outputs.cache-hit }}
 #         outcome: ${{ job.status }}
 #       env:
-#         OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.CODE_HEALTH_TOKEN && 'https://collector.example' || '' }}
-#         OTEL_EXPORTER_OTLP_HEADERS: Authorization=Bearer%20${{ secrets.CODE_HEALTH_TOKEN }}
+#         OTEL_EXPORTER_OTLP_ENDPOINT: ${{ github.event_name == 'push' && secrets.CODE_HEALTH_TOKEN && 'https://collector.example' || '' }}
+#         OTEL_EXPORTER_OTLP_HEADERS: ${{ github.event_name == 'push' && format('Authorization=Bearer%20{0}', secrets.CODE_HEALTH_TOKEN) || '' }}
 #
 # Pin by commit SHA, as for measure.yml. The code that runs is this action's
 # own checkout (`github.action_path`), so the pin covers the code that
@@ -54,6 +54,12 @@ inputs:
     # would fail to load and fail the job (tests/test_ci_health.py checks).
     description: "The job's status so far: pass the job context's status."
     default: ""
+  work:
+    description: "Explicit work outcomes as category=outcome pairs, comma-separated. Omit when unknown."
+    default: ""
+  tests-complete:
+    description: "Set true only when all intended test lanes finished and their JUnit reports were collected. This is a caller attestation."
+    default: "false"
   output:
     description: "Where the ci-health.json document is written."
     default: ci-health.json
@@ -133,6 +139,8 @@ runs:
         MV_JUNIT: ${{ inputs.junit }}
         MV_CACHES: ${{ inputs.caches }}
         MV_OUTCOME: ${{ inputs.outcome }}
+        MV_WORK: ${{ inputs.work }}
+        MV_TESTS_COMPLETE: ${{ inputs.tests-complete }}
         MV_OUTPUT: ${{ inputs.output }}
         GITHUB_TOKEN: ${{ inputs.token }}
         MIRA_VITALS_CI_REVISION: ${{ github.action_ref }}
@@ -153,5 +161,11 @@ runs:
         set +f
         [ -n "$MV_CACHES" ] && args+=(--cache "$MV_CACHES")
         [ -n "$MV_OUTCOME" ] && args+=(--outcome "$MV_OUTCOME")
+        IFS=',' read -r -a work_items <<< "$MV_WORK"
+        for item in "${work_items[@]}"; do
+          item="${item//[[:space:]]/}"
+          [ -n "$item" ] && args+=(--work "$item")
+        done
+        [ "$MV_TESTS_COMPLETE" = "true" ] && args+=(--tests-complete)
         "$bin" "${args[@]}"
         exit 0
