@@ -72,5 +72,5 @@ jobs:
     # The example a consumer copies is the one in measure.yml's header, but
     # the call they are most likely to read is this one.
     secrets:
-      OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
-      CODE_HEALTH_TOKEN: ${{ secrets.CODE_HEALTH_TOKEN }}
+      OTEL_EXPORTER_OTLP_HEADERS: ${{ github.event_name == 'push' && secrets.OTEL_EXPORTER_OTLP_HEADERS || '' }}
+      CODE_HEALTH_TOKEN: ${{ github.event_name == 'push' && secrets.CODE_HEALTH_TOKEN || '' }}

@@ -25,8 +25,8 @@ description: >-
 #         caches: uv=${{ steps.uv.outputs.cache-hit }}
 #         outcome: ${{ job.status }}
 #       env:
-#         OTEL_EXPORTER_OTLP_ENDPOINT: ${{ secrets.CODE_HEALTH_TOKEN && 'https://collector.example' || '' }}
-#         OTEL_EXPORTER_OTLP_HEADERS: Authorization=Bearer%20${{ secrets.CODE_HEALTH_TOKEN }}
+#         OTEL_EXPORTER_OTLP_ENDPOINT: ${{ github.event_name == 'push' && secrets.CODE_HEALTH_TOKEN && 'https://collector.example' || '' }}
+#         OTEL_EXPORTER_OTLP_HEADERS: ${{ github.event_name == 'push' && format('Authorization=Bearer%20{0}', secrets.CODE_HEALTH_TOKEN) || '' }}
 #
 # Pin by commit SHA, as for measure.yml. The code that runs is this action's
 # own checkout (`github.action_path`), so the pin covers the code that

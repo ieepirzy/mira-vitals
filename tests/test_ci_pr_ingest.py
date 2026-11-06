@@ -155,3 +155,10 @@ def test_pr_upload_and_trusted_import_are_separate():
     assert "repository: ieepirzy/mira-vitals" in trusted
     assert "persist-credentials: false" in trusted
     assert "github.event.workflow_run.head" not in trusted
+
+
+def test_self_measure_does_not_forward_ingest_credentials_to_pr_code():
+    root = Path(__file__).resolve().parent.parent
+    workflow = (root / ".github/workflows/ci.yml").read_text()
+    for secret in ("OTEL_EXPORTER_OTLP_HEADERS", "CODE_HEALTH_TOKEN"):
+        assert f"{secret}: ${{{{ github.event_name == 'push' && secrets.{secret} || '' }}}}" in workflow
