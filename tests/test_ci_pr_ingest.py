@@ -110,6 +110,11 @@ def test_untrusted_artifact_is_never_extracted_and_must_be_bounded():
         pr_ingest._work({"arbitrary-unbounded-label": "success"})
     with pytest.raises(ValueError):
         pr_ingest._selection({"change_categories": ["arbitrary-unbounded-label"]})
+    with pytest.raises(ValueError):
+        pr_ingest._selection({"selected": 3, "total": 2})
+    with pytest.raises(ValueError):
+        pr_ingest._selection({"changed_files": 1, "change_categories": ["tests"],
+                              "change_category_counts": {"tests": 2}})
 
 
 def test_archive_redirect_never_receives_github_authorization(monkeypatch):

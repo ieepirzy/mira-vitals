@@ -114,6 +114,12 @@ def _selection(value: Any) -> dict[str, Any] | None:
         if not isinstance(counts, dict) or any(k not in _CATEGORIES or _bounded_int(v) is None for k, v in counts.items()):
             raise ValueError("invalid category counts")
     out["change_category_counts"] = counts
+    if out["selected"] is not None and out["total"] is not None and out["selected"] > out["total"]:
+        raise ValueError("inconsistent selection counts")
+    if counts is not None and out["changed_files"] is not None and any(v > out["changed_files"] for v in counts.values()):
+        raise ValueError("category count exceeds changed files")
+    if counts is not None and out["change_categories"] is not None and set(counts) != set(out["change_categories"]):
+        raise ValueError("category counts do not match categories")
     return out
 
 
