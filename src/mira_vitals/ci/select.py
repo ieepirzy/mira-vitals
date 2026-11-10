@@ -24,6 +24,15 @@ Test-impact selection with the safety nets agreed for it:
 The unit of selection is the test *file* (pytest's per-file collection); the
 counts in ``selection.json`` say so in ``count_unit``.
 
+**Gates** narrow below the file. A gate names a keyword in the names of some
+tests, slow ones whose inputs are data no import graph sees (alert-rule unit
+tests, say), and the paths those inputs live in. The gate is closed when the
+change touches none of its inputs, fires no full-run trigger other than
+``non-py``, and reaches no file holding its tests through the graph. A closed
+gate skips its tests with ``-k "not <keyword>"`` (enforce, pull requests
+only) even when the rest of the run is full. Its policy can differ from the
+file selection's (``[select.gates.<name>] policy``).
+
 Result caching is not done here. With ``record_closure_hashes`` the selector
 records each test file's Lomitus ``closure_hash`` (code only) with the
 environment folded into ``extra`` -- Python version, lockfile digest, named
@@ -104,6 +113,27 @@ def matches(path: str, patterns: Iterable[str]) -> bool:
     return any(_glob_regex(p).match(path) for p in patterns)
 
 
+#: A gate keyword goes into a pytest ``-k`` expression: an identifier, and
+#: not one of the expression's operators.
+_KEYWORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{2,80}$")
+_GATE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,40}$")
+_K_OPERATORS = {"and", "or", "not"}
+#: Full-run triggers that leave a gate closed: the gate's own inputs decide
+#: for data files. Every other trigger (conftest, deps, ci, a graph it cannot
+#: trust, a selector error) opens every gate.
+GATE_NEUTRAL_TRIGGERS = {"non-py"}
+
+
+@dataclass
+class Gate:
+    keyword: str
+    inputs: list[str]
+    policy: str | None = None  # None: the selection's policy
+    #: Globs the gated test files must match; a gated file outside them (the
+    #: keyword caught a test it was not meant for) keeps the gate open.
+    files: list[str] | None = None
+
+
 @dataclass
 class Settings:
     policy: str = "advisory"
@@ -117,6 +147,7 @@ class Settings:
     cache_env: list[str] = field(default_factory=list)
     service_images: list[str] = field(default_factory=list)
     lockfiles: list[str] = field(default_factory=lambda: list(DEFAULT_LOCKFILES))
+    gates: dict[str, Gate] = field(default_factory=dict)
 
     @classmethod
     def from_table(cls, table: dict[str, Any] | None) -> Settings:
@@ -150,6 +181,29 @@ class Settings:
             raise ValueError(f"select.graph_sources must name ruff and/or lomitus, not {sorted(unknown)}")
         if "record_closure_hashes" in table:
             s.record_closure_hashes = bool(table["record_closure_hashes"])
+        gates = table.get("gates")
+        if gates is not None:
+            if not isinstance(gates, dict):
+                raise ValueError("select.gates must be a table of name -> gate")
+            for name, gate in gates.items():
+                if not isinstance(name, str) or not _GATE_NAME.match(name):
+                    raise ValueError(f"select.gates: {name!r} is not a short lowercase name")
+                if not isinstance(gate, dict):
+                    raise ValueError(f"select.gates.{name} must be a table")  # noqa: TRY004 - config errors are ValueError
+                unknown_keys = set(gate) - {"keyword", "inputs", "policy", "files"}
+                if unknown_keys:
+                    raise ValueError(f"select.gates.{name}: unknown keys {sorted(unknown_keys)}")
+                keyword = gate.get("keyword")
+                if not isinstance(keyword, str) or not _KEYWORD.match(keyword) or keyword.lower() in _K_OPERATORS:
+                    raise ValueError(f"select.gates.{name}.keyword must be an identifier of 3 or more characters")
+                inputs = strings(gate.get("inputs"), f"gates.{name}.inputs")
+                if not inputs:
+                    raise ValueError(f"select.gates.{name}.inputs must name at least one glob")
+                policy = gate.get("policy")
+                if policy is not None and policy not in ("advisory", "enforce"):
+                    raise ValueError(f"select.gates.{name}.policy must be 'advisory' or 'enforce'")
+                files = strings(gate["files"], f"gates.{name}.files") if "files" in gate else None
+                s.gates[name] = Gate(keyword=keyword, inputs=inputs, policy=policy, files=files)
         return s
 
 
@@ -245,6 +299,66 @@ def _ruff_version() -> str | None:
         return None
 
 
+def _text(repo: str, rel: str) -> str | None:
+    try:
+        with open(os.path.join(repo, rel), encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def gated_test_files(repo: str, test_files: list[str], keyword: str, conftests: list[str] = ()) -> set[str]:
+    """Test files that may hold a test pytest's ``-k <keyword>`` matches.
+
+    ``-k`` matches case-insensitively on module, class and function names,
+    parametrize ids, marker names and extra keywords, so a file counts when
+    the keyword appears anywhere in its path or text, and every test file
+    counts when a conftest.py mentions it (a conftest can add markers or
+    keywords to any test). Over-counting only opens the gate more often; a
+    file that cannot be read counts too."""
+    kw = keyword.lower()
+    if any(kw in (_text(repo, c) or kw).lower() for c in conftests):
+        return set(test_files)
+    return {rel for rel in test_files if kw in rel.lower() or kw in (_text(repo, rel) or kw).lower()}
+
+
+def decide_gates(
+    settings: Settings,
+    changes: list[Change],
+    triggers: list[str],
+    reached: set[str],
+    gated_files: dict[str, set[str]],
+) -> list[dict[str, Any]]:
+    """Per gate: open (its tests run) or closed, and why it is open."""
+    out = []
+    changed_paths = [p for c in changes for p in [c.path] + ([c.old_path] if c.old_path else [])]
+    for name, gate in sorted(settings.gates.items()):
+        # A path is also tried as a directory: a submodule bump changes only
+        # its gitlink, `vendor/rules`, which `vendor/rules/**` would miss.
+        reasons = [f"input:{p}" for p in changed_paths
+                   if matches(p, gate.inputs) or matches(p + "/-", gate.inputs)]
+        reasons += [f"trigger:{t}" for t in triggers if t not in GATE_NEUTRAL_TRIGGERS]
+        files = gated_files.get(name, set())
+        reasons += [f"reaches:{f}" for f in sorted(files & (reached | set(changed_paths)))]
+        # The always-run list is a must-run safety net: a gate never skips it.
+        reasons += [f"always-run:{f}" for f in sorted(files) if matches(f, settings.always_run)]
+        if gate.files is not None:
+            reasons += [f"unexpected-gated-file:{f}" for f in sorted(files) if not matches(f, gate.files)]
+        if not files:
+            reasons.append("no-gated-tests")
+        out.append(
+            {
+                "name": name,
+                "keyword": gate.keyword,
+                "policy": gate.policy,
+                "open": bool(reasons),
+                "reasons": reasons[:20],
+                "files": sorted(files)[:200],
+            }
+        )
+    return out
+
+
 def tracked_files(repo: str) -> list[str]:
     return [p for p in _git(["ls-files", "-z"], repo).split("\0") if p]
 
@@ -299,7 +413,7 @@ def decide(
     selected |= {f for f in tests if matches(f, settings.always_run)}
     if any(not _SAFE_PATH.match(f) for f in selected):
         triggers.add("unsafe-path")
-    return {"triggers": sorted(triggers), "selected": sorted(selected), "tests": sorted(tests)}
+    return {"triggers": sorted(triggers), "selected": sorted(selected), "tests": sorted(tests), "reached": reached}
 
 
 def _sha256_file(path: str) -> str | None:
@@ -356,6 +470,9 @@ def run(
     """Compute ``selection.json``. Never raises: any error is a full run with
     trigger ``selector_error`` (and the message in ``errors``)."""
     env = dict(os.environ) if env is None else env
+    # An explicit `--mode advisory` turns all skipping off, the gates'
+    # included. `--mode enforce` never raises a gate soaking in advisory.
+    override = policy
     policy = policy or settings.policy
     doc: dict[str, Any] = {
         "policy": policy,
@@ -380,11 +497,19 @@ def run(
             lomitus_files, lomitus_version = lomitus_affected(repo, base, head)
             doc["graph"]["lomitus_version"] = lomitus_version
         result = decide(settings, changes, test_files, graph, lomitus_files)
+        conftests = [f for f in all_files if f.rsplit("/", 1)[-1] == "conftest.py"]
+        gated = {name: gated_test_files(repo, test_files, g.keyword, conftests) for name, g in settings.gates.items()}
+        gates = decide_gates(settings, changes, result["triggers"], result["reached"], gated)
         doc["changed_files"] = len(changes)
     except Exception as exc:  # noqa: BLE001 - fail open: the run is full
         doc["errors"].append(f"{type(exc).__name__}: {str(exc)[:300]}")
         result = {"triggers": ["selector_error"], "selected": [], "tests": []}
         test_files = []
+        gates = [
+            {"name": n, "keyword": g.keyword, "policy": g.policy, "open": True, "reasons": ["selector_error"],
+             "files": []}
+            for n, g in sorted(settings.gates.items())
+        ]
 
     triggers = result["triggers"]
     decision = "full" if triggers else "selected"
@@ -392,11 +517,22 @@ def run(
     selected = result["selected"] if decision == "selected" else tests
     skipped = sorted(set(tests) - set(selected)) if decision == "selected" else []
     ran_selection = decision == "selected" and policy == "enforce" and event == "pull_request"
+    for gate in gates:
+        gate["policy"] = "advisory" if override == "advisory" else (gate["policy"] or policy)
+    closed = [g for g in gates if not g["open"]]
+    # A closed gate's tests are skipped only by an enforcing gate on a pull
+    # request, like the file selection; the default branch runs everything.
+    deselected = [g["keyword"] for g in closed if g["policy"] == "enforce" and event == "pull_request"]
     doc.update(
         {
             # `mode` is what ran (the CI-health contract); `decision` is what
             # the selector would have run. In advisory mode they differ.
-            "mode": "selected" if ran_selection else "full",
+            "mode": "selected" if ran_selection or deselected else "full",
+            "gates": gates,
+            # Keywords whose tests this change would skip (closed gates) and
+            # those it did skip: `ci report` counts escapes on the former.
+            "skipped_keywords": sorted(g["keyword"] for g in closed),
+            "deselected_keywords": sorted(deselected),
             "decision": decision,
             "triggers": triggers,
             "selected": len(selected) if tests else None,
@@ -429,10 +565,16 @@ def write_outputs(doc: dict[str, Any], output: str, args_out: str | None) -> Non
         json.dump(doc, handle, indent=2, sort_keys=True)
         handle.write("\n")
     if args_out:
-        # One test file per line, or empty for "run the whole suite". Read it
-        # with `mapfile -t`, never by interpolating it into a command line.
+        # pytest arguments, one per line: the test files to run (none means
+        # the whole suite), then `-k` and an expression when a gate deselects
+        # tests. Read it with `mapfile -t`, never by interpolating it into a
+        # command line.
+        lines = list(doc.get("run_files") or [])
+        keywords = [k for k in doc.get("deselected_keywords") or [] if _KEYWORD.match(k)]
+        if keywords:
+            lines += ["-k", " and ".join(f"not {k}" for k in keywords)]
         with open(args_out, "w", encoding="utf-8") as handle:
-            handle.writelines(path + "\n" for path in doc.get("run_files") or [])
+            handle.writelines(line + "\n" for line in lines)
 
 
 def main_select(argv_ns: Any, env: dict[str, str], table: dict[str, Any] | None) -> dict[str, Any]:
@@ -451,6 +593,9 @@ def main_select(argv_ns: Any, env: dict[str, str], table: dict[str, Any] | None)
             "count_unit": "files",
             "skipped_files": [],
             "run_files": [],
+            "gates": [],
+            "skipped_keywords": [],
+            "deselected_keywords": [],
             "selector": {"name": SELECTOR_NAME, "version": _selector_version(env)},
             "graph": {"source": "none"},
             "errors": [f"config: {exc}"],

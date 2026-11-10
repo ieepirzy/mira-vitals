@@ -154,7 +154,29 @@ def selection(path: str | None, warnings: list[str]) -> dict[str, Any] | None:
         "decision": raw.get("decision") if raw.get("decision") in ("full", "selected") else None,
         "count_unit": raw.get("count_unit") if raw.get("count_unit") in ("tests", "files") else None,
         "skipped_files": _paths(raw.get("skipped_files")),
+        # Gates (test-level selection by keyword): the keywords whose tests a
+        # closed gate would skip, read by `ci report` to count escapes like
+        # skipped_files, then dropped; which gates were closed; and which
+        # keywords this run did deselect.
+        "skipped_keywords": _keywords(raw.get("skipped_keywords")),
+        "deselected_keywords": _keywords(raw.get("deselected_keywords")) or [],
+        "gates_closed": sorted(
+            {
+                g["name"]
+                for g in raw.get("gates") or []
+                if isinstance(g, dict) and g.get("open") is False and _ident(g.get("name"))
+            }
+        ),
     }
+
+
+_KEYWORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{2,80}$")
+
+
+def _keywords(value: Any) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    return sorted({v for v in value[:50] if isinstance(v, str) and _KEYWORD.match(v)})
 
 
 _PATH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]{0,300}$")

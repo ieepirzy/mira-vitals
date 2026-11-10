@@ -123,6 +123,10 @@ def _select(args: argparse.Namespace, env: dict[str, str]) -> None:
         else f"{doc['decision']}: {doc.get('selected')} of {doc.get('total')} test files"
     )
     print(f"mira-vitals ci select: policy {doc['policy']}, decision {verdict}, ran {doc['mode']}")
+    for gate in doc.get("gates") or []:
+        state = "open (" + ", ".join(gate["reasons"][:3]) + ")" if gate["open"] else "closed"
+        skipping = " -> deselected" if gate["keyword"] in (doc.get("deselected_keywords") or []) else ""
+        print(f"  gate {gate['name']} [{gate['keyword']}, {gate['policy']}]: {state}{skipping}")
     for err in doc.get("errors") or []:
         _warn(f"select: {err}")
 
@@ -382,25 +386,34 @@ def _report(args: argparse.Namespace, env: dict[str, str]) -> None:
     for case in cases:
         case["quarantined"] = junit.test_id(case) in quarantined
     sel_opts = opts.get("selection")
-    if sel_opts is not None and sel_opts.get("skipped_files") is not None:
+    if sel_opts is not None and (
+        sel_opts.get("skipped_files") is not None or sel_opts.get("skipped_keywords") is not None
+    ):
         # An escape: a test the selector would have skipped (advisory) or did
         # skip, that failed. In advisory mode every test ran, so this is the
-        # direct proof a selection would have been unsafe.
-        skipped = set(sel_opts["skipped_files"])
+        # direct proof a selection would have been unsafe. A closed gate's
+        # tests are the ones pytest's case-insensitive `-k` would match.
+        skipped = set(sel_opts.get("skipped_files") or [])
+        keywords = [k.lower() for k in sel_opts.get("skipped_keywords") or []]
+
+        def would_skip(test_id: str) -> bool:
+            return test_id.split("::", 1)[0] in skipped or any(k in test_id.lower() for k in keywords)
+
         escaped = sorted(
             {
                 junit.test_id(c)
                 for c in cases
-                if c.get("outcome") in ("failed", "error") and junit.test_id(c).split("::", 1)[0] in skipped
+                if c.get("outcome") in ("failed", "error") and would_skip(junit.test_id(c))
             }
         )
         sel_opts["escapes"] = len(escaped)
         sel_opts["escape_ids"] = escaped[:50]
         sel_opts["skipped"] = len(skipped)
     if sel_opts is not None:
-        # The file list served the escape check; the exported record keeps
-        # the count, not up to 5,000 paths.
+        # The file and keyword lists served the escape check; the exported
+        # record keeps the counts and the closed gates' names.
         sel_opts.pop("skipped_files", None)
+        sel_opts.pop("skipped_keywords", None)
 
     doc = record.build(
         identity=ident,
