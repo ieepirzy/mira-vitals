@@ -283,3 +283,201 @@ def test_report_counts_no_escape_when_the_failure_was_selected(tmp_path):
         env={"MIRA_VITALS_CI_DIR": str(state)},
     )
     assert json.loads(out.read_text())["optimizations"]["selection"]["escapes"] == 0
+
+
+# -- gates: test-level skips by keyword when their inputs are untouched -----------
+
+GATE = {"gates": {"rules": {"keyword": "pinned_rule_tool", "inputs": ["rules/**", "tests/units/**"]}}}
+
+
+def _gates(changes, triggers=(), reached=(), files=("tests/test_rules.py",), table=GATE):
+    s = Settings.from_table(table)
+    return select.decide_gates(s, changes, list(triggers), set(reached), {"rules": set(files)})
+
+
+def test_a_gate_stays_closed_for_a_data_change_outside_its_inputs():
+    [g] = _gates([Change("modified", "clusters/app.yaml")], triggers=["non-py"])
+    assert g["open"] is False and g["reasons"] == [] and g["keyword"] == "pinned_rule_tool"
+
+
+def test_a_gate_opens_on_its_inputs_including_a_renamed_from_path():
+    assert _gates([Change("modified", "rules/alerts.yaml")], triggers=["non-py"])[0]["reasons"] == [
+        "input:rules/alerts.yaml"
+    ]
+    [g] = _gates([Change("renamed", "elsewhere/a.yaml", "tests/units/a_test.yaml")], triggers=["non-py"])
+    assert g["open"] and "input:tests/units/a_test.yaml" in g["reasons"]
+
+
+@pytest.mark.parametrize("trigger", ["conftest", "conftest-closure", "deps", "ci", "deleted-py", "unresolved",
+                                     "unknown-change", "unsafe-path", "selector_error"])
+def test_every_trigger_but_non_py_opens_a_gate(trigger):
+    [g] = _gates([Change("modified", "x.txt")], triggers=["non-py", trigger])
+    assert g["open"] and g["reasons"] == [f"trigger:{trigger}"]
+
+
+def test_a_gate_opens_when_the_change_reaches_a_file_holding_its_tests():
+    assert _gates([Change("modified", "src/pkg/a.py")], reached={"tests/test_rules.py"})[0]["open"]
+    # the test file itself changed
+    assert _gates([Change("modified", "tests/test_rules.py")])[0]["open"]
+    # reached, but not a gated file: closed
+    assert not _gates([Change("modified", "src/pkg/a.py")], reached={"tests/test_a.py"})[0]["open"]
+
+
+def test_a_gate_matching_no_test_stays_open():
+    assert _gates([Change("modified", "x.txt")], triggers=["non-py"], files=())[0]["reasons"] == ["no-gated-tests"]
+
+
+@pytest.mark.parametrize(
+    "gate",
+    [
+        {"keyword": "not", "inputs": ["a/**"]},
+        {"keyword": "a b", "inputs": ["a/**"]},
+        {"keyword": "x or y", "inputs": ["a/**"]},
+        {"keyword": "ab", "inputs": ["a/**"]},
+        {"keyword": "pinned_rule_tool", "inputs": []},
+        {"keyword": "pinned_rule_tool"},
+        {"keyword": "pinned_rule_tool", "inputs": ["a/**"], "policy": "yolo"},
+        {"keyword": "pinned_rule_tool", "inputs": ["a/**"], "inputz": ["b"]},
+        "pinned_rule_tool",
+    ],
+    ids=str,
+)
+def test_bad_gate_config_is_rejected(gate):
+    with pytest.raises(ValueError):
+        Settings.from_table({"gates": {"rules": gate}})
+    with pytest.raises(ValueError):
+        Settings.from_table({"gates": {"Bad Name": {"keyword": "pinned_rule_tool", "inputs": ["a/**"]}}})
+
+
+def test_gated_test_files_follow_pytest_k_matching(tmp_path):
+    (tmp_path / "tests").mkdir()
+    files = {
+        "tests/test_fn.py": "def test_x_with_the_PINNED_RULE_TOOL():\n    pass\n",  # case-insensitive
+        "tests/test_cls.py": "class TestPinned_rule_toolThings:\n    def test_a(self):\n        pass\n",
+        "tests/test_pinned_rule_tool_module.py": "def test_a():\n    pass\n",  # the module name matches
+        "tests/test_body_only.py": "def test_a():\n    run('pinned_rule_tool')\n",  # not a name: no match
+    }
+    for rel, text in files.items():
+        (tmp_path / rel).write_text(text)
+    got = select.gated_test_files(str(tmp_path), [*files, "tests/test_missing.py"], "pinned_rule_tool")
+    assert got == {"tests/test_fn.py", "tests/test_cls.py", "tests/test_pinned_rule_tool_module.py",
+                   "tests/test_missing.py"}  # unreadable counts as gated
+
+
+@pytest.fixture
+def gate_repo(tmp_path):
+    r = tmp_path / "repo"
+    for d in ("src/pkg", "tests", "rules", "clusters"):
+        (r / d).mkdir(parents=True)
+    (r / "src/pkg/__init__.py").write_text("")
+    (r / "src/pkg/a.py").write_text("def f():\n    return 1\n")
+    (r / "rules/alerts.yaml").write_text("rule: 1\n")
+    (r / "clusters/app.yaml").write_text("replicas: 1\n")
+    (r / "tests/test_a.py").write_text("from pkg.a import f\n\ndef test_f():\n    assert f() == 1\n")
+    (r / "tests/test_rules.py").write_text(
+        "def test_rule_shape():\n    pass\n\n"
+        "def test_rules_with_the_pinned_rule_tool():\n    raise AssertionError('gated test ran')\n"
+    )
+    (r / "pyproject.toml").write_text('[tool.ruff]\nsrc = ["src"]\n')
+    _git(r, "init", "-q", "-b", "main")
+    _git(r, "-c", "user.name=t", "-c", "user.email=t@t", "add", ".")
+    _git(r, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base")
+    return r, _rev(r)
+
+
+def _commit(r, rel, text):
+    (r / rel).write_text(text)
+    _git(r, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", f"change {rel}")
+    return _rev(r)
+
+
+def _gate_table(policy=None):
+    gate = {"keyword": "pinned_rule_tool", "inputs": ["rules/**"]}
+    if policy:
+        gate["policy"] = policy
+    return {"graph_sources": ["ruff"], "gates": {"rules": gate}}
+
+
+@needs_tools
+def test_an_enforcing_gate_deselects_its_tests_on_a_pull_request_in_a_full_run(gate_repo, tmp_path):
+    r, base = gate_repo
+    head = _commit(r, "clusters/app.yaml", "replicas: 2\n")
+    doc = select.main_select(_ns(r, base, head), {}, _gate_table("enforce"))
+    # the file selection (advisory) says full because of the YAML; the gate
+    # still skips its tests
+    assert doc["policy"] == "advisory" and doc["decision"] == "full" and doc["triggers"] == ["non-py"]
+    assert doc["deselected_keywords"] == ["pinned_rule_tool"] and doc["mode"] == "selected"
+    [g] = doc["gates"]
+    assert g["open"] is False and g["policy"] == "enforce" and g["files"] == ["tests/test_rules.py"]
+    args_out = tmp_path / "args.txt"
+    select.write_outputs(doc, str(tmp_path / "selection.json"), str(args_out))
+    args = args_out.read_text().splitlines()
+    assert args == ["-k", "not pinned_rule_tool"]
+    # pytest really skips the gated test (it would fail) and runs the rest
+    run = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=r,
+                         capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(r / "src")},
+                         timeout=120)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "2 passed, 1 deselected" in run.stdout
+
+
+@needs_tools
+def test_a_gate_input_change_runs_the_gated_tests(gate_repo):
+    r, base = gate_repo
+    head = _commit(r, "rules/alerts.yaml", "rule: 2\n")
+    doc = select.main_select(_ns(r, base, head), {}, _gate_table("enforce"))
+    assert doc["gates"][0]["open"] and doc["deselected_keywords"] == [] and doc["mode"] == "full"
+
+
+@needs_tools
+def test_a_closed_gate_never_skips_on_a_push_and_advisory_only_records(gate_repo):
+    r, base = gate_repo
+    head = _commit(r, "clusters/app.yaml", "replicas: 2\n")
+    for event in ("push", "schedule", None):
+        doc = select.main_select(_ns(r, base, head, event=event), {}, _gate_table("enforce"))
+        assert doc["deselected_keywords"] == [] and doc["mode"] == "full"
+        assert doc["skipped_keywords"] == ["pinned_rule_tool"]
+    doc = select.main_select(_ns(r, base, head), {}, _gate_table())  # inherits advisory
+    assert doc["gates"][0]["policy"] == "advisory" and doc["deselected_keywords"] == []
+    assert doc["skipped_keywords"] == ["pinned_rule_tool"] and doc["mode"] == "full"
+
+
+@needs_tools
+def test_a_selector_error_opens_every_gate(gate_repo):
+    r, _base = gate_repo
+    doc = select.main_select(_ns(r, "0" * 40, _rev(r)), {}, _gate_table("enforce"))
+    assert doc["triggers"] == ["selector_error"] and doc["gates"][0]["open"]
+    assert doc["deselected_keywords"] == [] and doc["mode"] == "full"
+
+
+def test_report_counts_a_gate_escape_and_records_the_closed_gate(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "selection.json").write_text(
+        json.dumps(
+            {
+                "mode": "full", "policy": "advisory", "decision": "full", "count_unit": "files",
+                "triggers": ["non-py"], "skipped_files": [], "skipped_keywords": ["pinned_rule_tool"],
+                "deselected_keywords": [],
+                "gates": [{"name": "rules", "keyword": "pinned_rule_tool", "open": False}],
+            }
+        )
+    )
+    junit_xml = tmp_path / "junit.xml"
+    junit_xml.write_text(
+        '<testsuites><testsuite name="pytest">'
+        '<testcase classname="tests.test_rules" name="test_rule_shape" time="0.1"><failure message="x"/></testcase>'
+        '<testcase classname="tests.test_rules" name="test_rules_with_the_Pinned_Rule_Tool" time="0.1">'
+        '<failure message="x"/></testcase>'
+        "</testsuite></testsuites>"
+    )
+    out = tmp_path / "ci-health.json"
+    rc = command.main(
+        ["report", "--junit", str(junit_xml), "--output", str(out), "--no-export", "--no-platform", "--quiet"],
+        env={"MIRA_VITALS_CI_DIR": str(state), "PATH": os.environ["PATH"]},
+    )
+    assert rc == 0
+    doc = json.loads(out.read_text())
+    sel = doc["optimizations"]["selection"]
+    assert sel["escapes"] == 1 and sel["escape_ids"] == ["tests/test_rules.py::test_rules_with_the_Pinned_Rule_Tool"]
+    assert "skipped_keywords" not in sel and sel["gates_closed"] == ["rules"]

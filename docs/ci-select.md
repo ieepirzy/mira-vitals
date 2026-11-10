@@ -56,6 +56,46 @@ runs with zero escapes** (`ci.selection.escapes` in CI health). An escape in
 advisory mode means a trigger or the always-run list is missing something:
 fix that first.
 
+## Gates: skip slow data-driven tests their change cannot reach
+
+Some tests are slow and depend on data no import graph sees: alert-rule unit
+tests that read YAML, say. In a repository that is mostly data, `non-py`
+makes nearly every run full, so file selection never saves them. A **gate**
+names those tests by a keyword and their inputs by globs:
+
+```toml
+[select.gates.rules]
+keyword = "pinned_rule_tool"      # in the gated tests' function names
+inputs = ["alerts/**", "tests/rule_units/**"]
+policy = "enforce"                # optional; default: select.policy
+```
+
+A gate is **open** (its tests run) when any of these holds:
+
+- a changed path (or a renamed file's old path) matches `inputs`;
+- any full-run trigger fired other than `non-py`: conftest, deps, CI files, a
+  deleted or unresolved module, a selector error. The gate's own inputs
+  decide for data files; nothing else is trusted to;
+- the import graph reaches a file holding gated tests, or that file changed;
+- the keyword matches no test (`no-gated-tests`: a configuration to fix).
+
+Otherwise it is **closed**. A closed gate whose policy is `enforce` adds
+`-k "not <keyword>"` to the args file on `pull_request` events, even when the
+rest of the run is full. Pushes, schedules and the default branch run
+everything. In `advisory` a closed gate only records.
+
+The keyword is matched the way pytest's `-k` matches: case-insensitively,
+against test function, class and module names, so pick one that only the
+gated tests carry. `selection.json` lists each gate with `open`, its
+`reasons` and the files holding its tests (`files`). `skipped_keywords`
+holds the closed gates' keywords, and `ci report` counts a failed test that
+matches one of them as an **escape**, as it does for skipped files.
+`deselected_keywords` holds the keywords this run did skip.
+
+A gate may enforce while the file selection stays advisory: its inputs are
+named globs, not an inferred graph, and the default branch still runs the
+whole suite.
+
 ## Result caching (recorded only)
 
 With `record_closure_hashes = true`, each test file's Lomitus `closure_hash`
@@ -105,7 +145,8 @@ docker = []                         # an empty list turns a default off
       --head "${{ github.sha }}" --args-out "$RUNNER_TEMP/tests.txt"
 - name: Test
   run: |
-    mapfile -t SELECTED < "$RUNNER_TEMP/tests.txt"   # empty means everything
+    mapfile -t SELECTED < "$RUNNER_TEMP/tests.txt"   # empty means everything;
+    # may end with `-k` and an expression when a gate deselects tests
     pytest --junitxml=reports/junit.xml "${SELECTED[@]}"
 ```
 

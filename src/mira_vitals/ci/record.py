@@ -214,6 +214,11 @@ def metric_points(doc: dict[str, Any]) -> list[dict[str, Any]]:
         add("ci.selection.escapes", "{test}", sel.get("escapes"), **mode)
         for trigger in sel.get("triggers") or []:
             add("ci.selection.full_trigger", "1", 1, **{"ci.selection.trigger": trigger})
+        deselected = {k.lower() for k in sel.get("deselected_keywords") or []}
+        for gate in sel.get("gates_closed") or []:
+            add("ci.selection.gate.closed", "1", 1, **{"ci.selection.gate": gate, **mode})
+        if deselected:
+            add("ci.selection.gate.deselected", "{gate}", len(deselected), **mode)
     par = opts.get("parallelism")
     if par:
         add("ci.xdist.workers", "{worker}", par.get("count"))
