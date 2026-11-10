@@ -112,8 +112,13 @@ its inputs are named, not inferred; for Python changes it relies on the same
 import graph as file selection, with the same blind spots (code run through
 a subprocess, dynamic imports), and the default branch running the whole
 suite is the safety net. Soaking a gate in `advisory` first measures that.
-An explicit `--mode` overrides every gate's policy: `--mode advisory` turns
-all skipping off.
+An explicit `--mode advisory` turns all skipping off, the gates' included;
+`--mode enforce` leaves a gate configured `advisory` advisory.
+
+Discovery reads the repository's Python text, so two matches stay invisible
+to it: a parametrize id computed from data (a file named after the keyword)
+and a marker added by a plugin module rather than a conftest. Avoid both for
+a gated keyword; `files` limits the damage.
 
 The gate writes its own `-k`. pytest keeps only the last `-k` it is given,
 so a workflow that passes one too loses either the gate's or its own.

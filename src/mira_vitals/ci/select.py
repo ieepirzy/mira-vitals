@@ -470,8 +470,8 @@ def run(
     """Compute ``selection.json``. Never raises: any error is a full run with
     trigger ``selector_error`` (and the message in ``errors``)."""
     env = dict(os.environ) if env is None else env
-    # An explicit --mode overrides every policy, the gates' included: an
-    # operator's `--mode advisory` turns all skipping off.
+    # An explicit `--mode advisory` turns all skipping off, the gates'
+    # included. `--mode enforce` never raises a gate soaking in advisory.
     override = policy
     policy = policy or settings.policy
     doc: dict[str, Any] = {
@@ -518,7 +518,7 @@ def run(
     skipped = sorted(set(tests) - set(selected)) if decision == "selected" else []
     ran_selection = decision == "selected" and policy == "enforce" and event == "pull_request"
     for gate in gates:
-        gate["policy"] = override or gate["policy"] or policy
+        gate["policy"] = "advisory" if override == "advisory" else (gate["policy"] or policy)
     closed = [g for g in gates if not g["open"]]
     # A closed gate's tests are skipped only by an enforcing gate on a pull
     # request, like the file selection; the default branch runs everything.

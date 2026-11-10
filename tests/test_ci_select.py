@@ -502,6 +502,9 @@ def test_mode_advisory_on_the_command_line_turns_every_gate_off(gate_repo):
     doc = select.main_select(_ns(r, base, head, mode="advisory"), {}, _gate_table("enforce"))
     assert doc["gates"][0]["open"] is False and doc["gates"][0]["policy"] == "advisory"
     assert doc["deselected_keywords"] == [] and doc["mode"] == "full"
+    # ...and --mode enforce never raises a gate soaking in advisory
+    doc = select.main_select(_ns(r, base, head, mode="enforce"), {}, _gate_table("advisory"))
+    assert doc["gates"][0]["policy"] == "advisory" and doc["deselected_keywords"] == []
 
 
 @needs_tools
