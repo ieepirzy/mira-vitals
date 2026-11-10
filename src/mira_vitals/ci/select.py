@@ -129,6 +129,9 @@ class Gate:
     keyword: str
     inputs: list[str]
     policy: str | None = None  # None: the selection's policy
+    #: Globs the gated test files must match; a gated file outside them (the
+    #: keyword caught a test it was not meant for) keeps the gate open.
+    files: list[str] | None = None
 
 
 @dataclass
@@ -187,7 +190,7 @@ class Settings:
                     raise ValueError(f"select.gates: {name!r} is not a short lowercase name")
                 if not isinstance(gate, dict):
                     raise ValueError(f"select.gates.{name} must be a table")  # noqa: TRY004 - config errors are ValueError
-                unknown_keys = set(gate) - {"keyword", "inputs", "policy"}
+                unknown_keys = set(gate) - {"keyword", "inputs", "policy", "files"}
                 if unknown_keys:
                     raise ValueError(f"select.gates.{name}: unknown keys {sorted(unknown_keys)}")
                 keyword = gate.get("keyword")
@@ -199,7 +202,8 @@ class Settings:
                 policy = gate.get("policy")
                 if policy is not None and policy not in ("advisory", "enforce"):
                     raise ValueError(f"select.gates.{name}.policy must be 'advisory' or 'enforce'")
-                s.gates[name] = Gate(keyword=keyword, inputs=inputs, policy=policy)
+                files = strings(gate["files"], f"gates.{name}.files") if "files" in gate else None
+                s.gates[name] = Gate(keyword=keyword, inputs=inputs, policy=policy, files=files)
         return s
 
 
@@ -295,26 +299,27 @@ def _ruff_version() -> str | None:
         return None
 
 
-def gated_test_files(repo: str, test_files: list[str], keyword: str) -> set[str]:
-    """Test files holding a test pytest's ``-k <keyword>`` matches: the path
-    names it, or a test function or class name contains it (``-k`` matching
-    is case-insensitive). A file that cannot be read counts as gated."""
+def _text(repo: str, rel: str) -> str | None:
+    try:
+        with open(os.path.join(repo, rel), encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def gated_test_files(repo: str, test_files: list[str], keyword: str, conftests: list[str] = ()) -> set[str]:
+    """Test files that may hold a test pytest's ``-k <keyword>`` matches.
+
+    ``-k`` matches case-insensitively on module, class and function names,
+    parametrize ids, marker names and extra keywords, so a file counts when
+    the keyword appears anywhere in its path or text, and every test file
+    counts when a conftest.py mentions it (a conftest can add markers or
+    keywords to any test). Over-counting only opens the gate more often; a
+    file that cannot be read counts too."""
     kw = keyword.lower()
-    names = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+(\w+)", re.MULTILINE)
-    out: set[str] = set()
-    for rel in test_files:
-        if kw in rel.lower():
-            out.add(rel)
-            continue
-        try:
-            with open(os.path.join(repo, rel), encoding="utf-8", errors="replace") as handle:
-                text = handle.read()
-        except OSError:
-            out.add(rel)
-            continue
-        if any(kw in m.lower() for m in names.findall(text)):
-            out.add(rel)
-    return out
+    if any(kw in (_text(repo, c) or kw).lower() for c in conftests):
+        return set(test_files)
+    return {rel for rel in test_files if kw in rel.lower() or kw in (_text(repo, rel) or kw).lower()}
 
 
 def decide_gates(
@@ -328,10 +333,17 @@ def decide_gates(
     out = []
     changed_paths = [p for c in changes for p in [c.path] + ([c.old_path] if c.old_path else [])]
     for name, gate in sorted(settings.gates.items()):
-        reasons = [f"input:{p}" for p in changed_paths if matches(p, gate.inputs)]
+        # A path is also tried as a directory: a submodule bump changes only
+        # its gitlink, `vendor/rules`, which `vendor/rules/**` would miss.
+        reasons = [f"input:{p}" for p in changed_paths
+                   if matches(p, gate.inputs) or matches(p + "/-", gate.inputs)]
         reasons += [f"trigger:{t}" for t in triggers if t not in GATE_NEUTRAL_TRIGGERS]
         files = gated_files.get(name, set())
         reasons += [f"reaches:{f}" for f in sorted(files & (reached | set(changed_paths)))]
+        # The always-run list is a must-run safety net: a gate never skips it.
+        reasons += [f"always-run:{f}" for f in sorted(files) if matches(f, settings.always_run)]
+        if gate.files is not None:
+            reasons += [f"unexpected-gated-file:{f}" for f in sorted(files) if not matches(f, gate.files)]
         if not files:
             reasons.append("no-gated-tests")
         out.append(
@@ -458,6 +470,9 @@ def run(
     """Compute ``selection.json``. Never raises: any error is a full run with
     trigger ``selector_error`` (and the message in ``errors``)."""
     env = dict(os.environ) if env is None else env
+    # An explicit --mode overrides every policy, the gates' included: an
+    # operator's `--mode advisory` turns all skipping off.
+    override = policy
     policy = policy or settings.policy
     doc: dict[str, Any] = {
         "policy": policy,
@@ -482,7 +497,8 @@ def run(
             lomitus_files, lomitus_version = lomitus_affected(repo, base, head)
             doc["graph"]["lomitus_version"] = lomitus_version
         result = decide(settings, changes, test_files, graph, lomitus_files)
-        gated = {name: gated_test_files(repo, test_files, g.keyword) for name, g in settings.gates.items()}
+        conftests = [f for f in all_files if f.rsplit("/", 1)[-1] == "conftest.py"]
+        gated = {name: gated_test_files(repo, test_files, g.keyword, conftests) for name, g in settings.gates.items()}
         gates = decide_gates(settings, changes, result["triggers"], result["reached"], gated)
         doc["changed_files"] = len(changes)
     except Exception as exc:  # noqa: BLE001 - fail open: the run is full
@@ -502,7 +518,7 @@ def run(
     skipped = sorted(set(tests) - set(selected)) if decision == "selected" else []
     ran_selection = decision == "selected" and policy == "enforce" and event == "pull_request"
     for gate in gates:
-        gate["policy"] = gate["policy"] or policy
+        gate["policy"] = override or gate["policy"] or policy
     closed = [g for g in gates if not g["open"]]
     # A closed gate's tests are skipped only by an enforcing gate on a pull
     # request, like the file selection; the default branch runs everything.

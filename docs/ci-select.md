@@ -67,8 +67,14 @@ names those tests by a keyword and their inputs by globs:
 [select.gates.rules]
 keyword = "pinned_rule_tool"      # in the gated tests' function names
 inputs = ["alerts/**", "tests/rule_units/**"]
+files = ["tests/test_*_alerts.py"]  # optional: where gated tests may live
 policy = "enforce"                # optional; default: select.policy
 ```
+
+List every path the gated tests read in `inputs`, including the pinned
+tool's version if it lives outside CI, dependency or Docker files. Recording
+the files each gated test opens (a Python audit hook in a pytest plugin) is
+a reliable way to find them.
 
 A gate is **open** (its tests run) when any of these holds:
 
@@ -76,25 +82,41 @@ A gate is **open** (its tests run) when any of these holds:
 - any full-run trigger fired other than `non-py`: conftest, deps, CI files, a
   deleted or unresolved module, a selector error. The gate's own inputs
   decide for data files; nothing else is trusted to;
-- the import graph reaches a file holding gated tests, or that file changed;
+- the import graph reaches a file that may hold gated tests, or that file
+  changed;
+- such a file is in `always_run`, or falls outside the gate's `files` globs
+  (the keyword caught a test it was not meant for);
 - the keyword matches no test (`no-gated-tests`: a configuration to fix).
+
+A file "may hold gated tests" when the keyword appears anywhere in its path
+or text, since pytest's `-k` matches case-insensitively on module, class and
+function names, parametrize ids, marker names and extra keywords. When any
+`conftest.py` mentions the keyword, every test file counts. This over-counts
+on purpose: a miss would let `-k` skip a test whose imports nobody checked.
 
 Otherwise it is **closed**. A closed gate whose policy is `enforce` adds
 `-k "not <keyword>"` to the args file on `pull_request` events, even when the
 rest of the run is full. Pushes, schedules and the default branch run
 everything. In `advisory` a closed gate only records.
 
-The keyword is matched the way pytest's `-k` matches: case-insensitively,
-against test function, class and module names, so pick one that only the
-gated tests carry. `selection.json` lists each gate with `open`, its
+Pick a keyword only the gated tests carry, and set `files` so a new test
+that happens to match it keeps the gate open instead of being skipped on a
+data change its own inputs would have caught. `selection.json` lists each gate with `open`, its
 `reasons` and the files holding its tests (`files`). `skipped_keywords`
 holds the closed gates' keywords, and `ci report` counts a failed test that
 matches one of them as an **escape**, as it does for skipped files.
 `deselected_keywords` holds the keywords this run did skip.
 
-A gate may enforce while the file selection stays advisory: its inputs are
-named globs, not an inferred graph, and the default branch still runs the
-whole suite.
+A gate may enforce while the file selection stays advisory. For data files
+its inputs are named, not inferred; for Python changes it relies on the same
+import graph as file selection, with the same blind spots (code run through
+a subprocess, dynamic imports), and the default branch running the whole
+suite is the safety net. Soaking a gate in `advisory` first measures that.
+An explicit `--mode` overrides every gate's policy: `--mode advisory` turns
+all skipping off.
+
+The gate writes its own `-k`. pytest keeps only the last `-k` it is given,
+so a workflow that passes one too loses either the gate's or its own.
 
 ## Result caching (recorded only)
 

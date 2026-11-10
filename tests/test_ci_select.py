@@ -349,19 +349,52 @@ def test_bad_gate_config_is_rejected(gate):
         Settings.from_table({"gates": {"Bad Name": {"keyword": "pinned_rule_tool", "inputs": ["a/**"]}}})
 
 
-def test_gated_test_files_follow_pytest_k_matching(tmp_path):
+def test_gated_test_files_cover_everything_pytest_k_can_match(tmp_path):
+    """-k matches names, parametrize ids, markers and extra keywords: any
+    mention counts (over-counting only opens the gate more often)."""
     (tmp_path / "tests").mkdir()
     files = {
         "tests/test_fn.py": "def test_x_with_the_PINNED_RULE_TOOL():\n    pass\n",  # case-insensitive
         "tests/test_cls.py": "class TestPinned_rule_toolThings:\n    def test_a(self):\n        pass\n",
         "tests/test_pinned_rule_tool_module.py": "def test_a():\n    pass\n",  # the module name matches
-        "tests/test_body_only.py": "def test_a():\n    run('pinned_rule_tool')\n",  # not a name: no match
+        "tests/test_marker.py": "@pytest.mark.pinned_rule_tool\ndef test_a():\n    pass\n",
+        "tests/test_param.py": "@pytest.mark.parametrize('x', [1], ids=['pinned_rule_tool_case'])\ndef test_a(x): pass\n",
+        "tests/test_other.py": "def test_a():\n    pass\n",
     }
     for rel, text in files.items():
         (tmp_path / rel).write_text(text)
     got = select.gated_test_files(str(tmp_path), [*files, "tests/test_missing.py"], "pinned_rule_tool")
-    assert got == {"tests/test_fn.py", "tests/test_cls.py", "tests/test_pinned_rule_tool_module.py",
-                   "tests/test_missing.py"}  # unreadable counts as gated
+    assert got == set(files) - {"tests/test_other.py"} | {"tests/test_missing.py"}  # unreadable counts
+
+
+def test_a_conftest_naming_the_keyword_gates_every_test_file(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/conftest.py").write_text(
+        "def pytest_collection_modifyitems(items):\n"
+        "    for i in items: i.add_marker('pinned_rule_tool')\n"
+    )
+    (tmp_path / "tests/test_other.py").write_text("def test_a():\n    pass\n")
+    got = select.gated_test_files(str(tmp_path), ["tests/test_other.py"], "pinned_rule_tool", ["tests/conftest.py"])
+    assert got == {"tests/test_other.py"}
+
+
+def test_a_gate_never_skips_the_always_run_list():
+    table = {**GATE, "always_run": ["tests/test_rules.py"]}
+    [g] = _gates([Change("modified", "x.txt")], triggers=["non-py"], table=table)
+    assert g["open"] and g["reasons"] == ["always-run:tests/test_rules.py"]
+
+
+def test_a_gated_file_outside_the_expected_files_keeps_the_gate_open():
+    table = {"gates": {"rules": {**GATE["gates"]["rules"], "files": ["tests/test_rules.py"]}}}
+    assert not _gates([Change("modified", "x.txt")], triggers=["non-py"], table=table)[0]["open"]
+    [g] = _gates([Change("modified", "x.txt")], triggers=["non-py"], table=table,
+                 files=("tests/test_rules.py", "tests/test_firewall_rules.py"))
+    assert g["open"] and g["reasons"] == ["unexpected-gated-file:tests/test_firewall_rules.py"]
+
+
+def test_a_submodule_bump_inside_the_inputs_opens_the_gate():
+    table = {"gates": {"rules": {"keyword": "pinned_rule_tool", "inputs": ["vendor/rules/**"]}}}
+    assert _gates([Change("modified", "vendor/rules")], triggers=["non-py"], table=table)[0]["open"]
 
 
 @pytest.fixture
@@ -440,6 +473,35 @@ def test_a_closed_gate_never_skips_on_a_push_and_advisory_only_records(gate_repo
     doc = select.main_select(_ns(r, base, head), {}, _gate_table())  # inherits advisory
     assert doc["gates"][0]["policy"] == "advisory" and doc["deselected_keywords"] == []
     assert doc["skipped_keywords"] == ["pinned_rule_tool"] and doc["mode"] == "full"
+
+
+@needs_tools
+def test_a_marker_only_gated_test_reached_by_a_code_change_runs(gate_repo, tmp_path):
+    """Review finding: a test -k matches by marker, importing the changed
+    module, must open the gate (it used to be missed and deselected)."""
+    r, _ = gate_repo
+    (r / "src/pkg/render.py").write_text("def render():\n    return 1\n")
+    (r / "tests/test_marker.py").write_text(
+        "import pytest\nfrom pkg.render import render\n\n"
+        "@pytest.mark.pinned_rule_tool\ndef test_render():\n    assert render() == 1\n"
+    )
+    _git(r, "-c", "user.name=t", "-c", "user.email=t@t", "add", ".")
+    _git(r, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "marker test")
+    base = _rev(r)
+    head = _commit(r, "src/pkg/render.py", "def render():\n    return 2\n")
+    doc = select.main_select(_ns(r, base, head), {}, _gate_table("enforce"))
+    [g] = doc["gates"]
+    assert g["open"] and "reaches:tests/test_marker.py" in g["reasons"]
+    assert doc["deselected_keywords"] == []
+
+
+@needs_tools
+def test_mode_advisory_on_the_command_line_turns_every_gate_off(gate_repo):
+    r, base = gate_repo
+    head = _commit(r, "clusters/app.yaml", "replicas: 2\n")
+    doc = select.main_select(_ns(r, base, head, mode="advisory"), {}, _gate_table("enforce"))
+    assert doc["gates"][0]["open"] is False and doc["gates"][0]["policy"] == "advisory"
+    assert doc["deselected_keywords"] == [] and doc["mode"] == "full"
 
 
 @needs_tools
