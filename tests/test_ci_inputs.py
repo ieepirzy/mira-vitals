@@ -28,9 +28,22 @@ MAP = {
 }
 
 
-def _d(changes, data_map=MAP, settings=None):
+#: What the recording saw: files read, directories listed.
+SEEN = (
+    {"rules/alerts/disk.yaml", "docs/guide.txt", "src/hashed/m.py"},
+    {"tests/units", "tests/units/deep", "rules/alerts"},
+)
+
+
+def _d(changes, data_map=MAP, settings=None, seen=SEEN):
     return decide(
-        settings or Settings(), changes, TESTS, {t: [] for t in TESTS}, None, data_map
+        settings or Settings(),
+        changes,
+        TESTS,
+        {t: [] for t in TESTS},
+        None,
+        data_map,
+        seen,
     )
 
 
@@ -83,7 +96,7 @@ def test_other_full_run_triggers_still_fire_with_a_map():
             Change("modified", "pyproject.toml"),
         ]
     )
-    assert r["triggers"] == ["deps"]
+    assert "deps" in r["triggers"]
 
 
 def test_python_read_as_data_is_selected_through_the_map():
@@ -275,10 +288,22 @@ def test_the_plugin_is_standard_library_only():
 def test_load_map_rejects_bad_maps(tmp_path):
     p = tmp_path / "m.json"
     for bad in (
-        {"version": 2, "tests": {}},
-        {"version": 1},
-        {"version": 1, "tests": {"t.py": {"inputs": "a/*", "code_digest": "x"}}},
-        {"version": 1, "tests": {"t.py": {"inputs": ["a/*"]}}},
+        {"version": 1, "tests": {}},  # an older format: re-record
+        {"version": 2},
+        {
+            "version": 2,
+            "tests": {
+                "t.py": {"inputs": "a/*", "code_digest": "x", "reads": [], "lists": []}
+            },
+        },
+        {
+            "version": 2,
+            "tests": {"t.py": {"inputs": ["a/*"], "reads": [], "lists": []}},
+        },
+        {
+            "version": 2,
+            "tests": {"t.py": {"inputs": ["a/*"], "code_digest": "x"}},
+        },  # no reads/lists
     ):
         p.write_text(json.dumps(bad))
         with pytest.raises(ValueError):
@@ -400,3 +425,206 @@ def test_an_unreadable_map_fails_open(mapped_repo):
     _git(r, "commit", "-qam", "broken map")
     doc = select.main_select(_ns(r, base, _rev(r)), {}, TABLE)
     assert doc["triggers"] == ["selector_error"] and doc["mode"] == "full"
+
+
+# -- review regressions ---------------------------------------------------------
+# Each of these failed before the fix it names.
+
+
+def _rec(project, test_file, *extra):
+    return inputs._record_one(
+        str(project), sys.executable, _plugin_dir(), test_file, list(extra), 120
+    )
+
+
+def _data_project(root, n=0):
+    (root / "tests").mkdir(parents=True)
+    (root / "data").mkdir()
+    for k in range(n):
+        (root / f"data/f{k}.txt").write_text(str(k))
+    return root
+
+
+def test_reads_on_other_threads_are_all_recorded(tmp_path):
+    """The re-entrancy guard is per thread: a process-global flag dropped
+    other threads' opens made while the hook was busy."""
+    r = _data_project(tmp_path / "proj", 200)
+    (r / "tests/test_threads.py").write_text(
+        "from concurrent.futures import ThreadPoolExecutor\n"
+        "def test_t():\n"
+        "    def rd(k):\n"
+        "        with open(f'data/f{k}.txt') as h:\n"
+        "            return h.read()\n"
+        "    with ThreadPoolExecutor(16) as ex:\n"
+        "        assert len(list(ex.map(rd, range(200)))) == 200\n"
+    )
+    rec = _rec(r, "tests/test_threads.py")
+    assert {f"data/f{k}.txt" for k in range(200)} <= set(rec["reads"])
+
+
+def test_a_checkout_under_a_directory_named_pytest_still_records(tmp_path):
+    """The runner is recognised by pytest's install location, not by a
+    `pytest` path segment the checkout itself may contain."""
+    r = _data_project(tmp_path / "pytest" / "proj", 1)
+    (r / "tests/test_p.py").write_text(
+        "def test_p():\n    open('data/f0.txt').read()\n"
+    )
+    rec = _rec(r, "tests/test_p.py")
+    assert "data/f0.txt" in rec["reads"]
+
+
+def test_pytests_vendored_py_library_is_a_test_read(tmp_path):
+    r = _data_project(tmp_path / "proj", 1)
+    (r / "tests/test_py.py").write_text(
+        "from _pytest._py.path import LocalPath\ndef test_l():\n    assert LocalPath('data/f0.txt').read()\n"
+    )
+    rec = _rec(r, "tests/test_py.py")
+    assert "data/f0.txt" in rec["reads"]
+
+
+def test_loader_get_data_of_a_data_file_is_recorded(tmp_path):
+    r = _data_project(tmp_path / "proj")
+    (r / "pkg").mkdir()
+    (r / "pkg/__init__.py").write_text("")
+    (r / "pkg/res.json").write_text("{}")
+    (r / "tests/test_gd.py").write_text(
+        "import pkgutil, sys\nsys.path.insert(0, '.')\n"
+        "def test_g():\n    assert pkgutil.get_data('pkg', 'res.json') == b'{}'\n"
+    )
+    rec = _rec(r, "tests/test_gd.py")
+    assert "pkg/res.json" in rec["reads"]
+    assert "pkg/__init__.py" not in rec["reads"]  # importing it is the graph's business
+
+
+def test_sqlite_databases_opened_by_path_are_recorded(tmp_path):
+    r = _data_project(tmp_path / "proj")
+    import sqlite3
+
+    sqlite3.connect(str(r / "data/db.sqlite")).close()
+    (r / "tests/test_sq.py").write_text(
+        "import sqlite3\ndef test_s():\n    sqlite3.connect('data/db.sqlite').close()\n"
+    )
+    rec = _rec(r, "tests/test_sq.py")
+    assert "data/db.sqlite" in rec["reads"]
+
+
+def test_deselected_tests_make_the_record_incomplete(tmp_path):
+    r = _data_project(tmp_path / "proj", 1)
+    (r / "tests/test_k.py").write_text(
+        "def test_kept():\n    pass\ndef test_dropped():\n    open('data/f0.txt').read()\n"
+    )
+    rec = _rec(r, "tests/test_k.py", "-k", "kept")
+    assert any(x.startswith("deselected:") for x in rec["incomplete"])
+    assert inputs.to_globs(rec)[0] == ["**"]
+
+
+def test_a_symlinked_read_records_the_link_and_its_target(tmp_path):
+    r = _data_project(tmp_path / "proj", 1)
+    (r / "links").mkdir()
+    os.symlink("../data/f0.txt", r / "links/alias.txt")
+    (r / "tests/test_ln.py").write_text(
+        "def test_l():\n    open('links/alias.txt').read()\n"
+    )
+    rec = _rec(r, "tests/test_ln.py")
+    assert {"links/alias.txt", "data/f0.txt"} <= set(rec["reads"])
+
+
+def test_a_symlink_out_of_the_repository_reads_everything(tmp_path):
+    r = _data_project(tmp_path / "proj")
+    (tmp_path / "outside.txt").write_text("x")
+    os.symlink(str(tmp_path / "outside.txt"), r / "data/out.txt")
+    (r / "tests/test_out.py").write_text(
+        "def test_o():\n    open('data/out.txt').read()\n"
+    )
+    rec = _rec(r, "tests/test_out.py")
+    assert inputs.to_globs(rec)[0] == ["**"]
+
+
+def test_a_new_data_file_is_a_full_run():
+    """Nothing recorded vouches for who reads a file that did not exist."""
+    r = _d([Change("added", "rules/alerts/new.yaml")])
+    assert r["triggers"] == ["data-added"]
+    r = _d([Change("renamed", "rules/alerts/moved.yaml", "rules/alerts/disk.yaml")])
+    assert "data-added" in r["triggers"]
+
+
+def test_a_data_file_no_recording_saw_is_a_full_run():
+    # docs/other.txt matches test_docs' docs/* glob, but nobody read it and
+    # docs/ was never listed: a stat probe or C code may read it.
+    r = _d([Change("modified", "docs/other.txt")])
+    assert r["triggers"] == ["data-unseen"]
+
+
+def test_editing_a_recorded_read_stays_selective():
+    r = _d(
+        [
+            Change("modified", "docs/guide.txt"),
+            Change("modified", "tests/units/deep/case.yaml"),
+        ]
+    )
+    assert r["triggers"] == []
+    assert (
+        "tests/test_docs.py" in r["selected"] and "tests/test_rules.py" in r["selected"]
+    )
+
+
+def test_never_feeds_globs_are_exempt_from_the_fail_safe():
+    r = _d([Change("added", "docs/NOTES.md")])  # **/*.md is a default ignore glob
+    assert r["triggers"] == []
+
+
+@pytest.fixture
+def subdir_repo(tmp_path):
+    """A checkout whose project (and --repo) is a sub-directory."""
+    top = tmp_path / "mono"
+    r = top / "proj"
+    (r / "tests").mkdir(parents=True)
+    (r / "rules").mkdir()
+    (top / "other").mkdir()
+    (top / "other/x.txt").write_text("x\n")
+    (r / "rules/a.yaml").write_text("a: 1\n")
+    (r / "tests/__init__.py").write_text("")
+    (r / "tests/test_rules.py").write_text(
+        "def test_r():\n    open('rules/a.yaml').read()\n"
+    )
+    (r / "tests/test_none.py").write_text("def test_n():\n    pass\n")
+    (r / "pyproject.toml").write_text("[tool.ruff]\n")
+    tests = ["tests/test_none.py", "tests/test_rules.py"]
+    doc = inputs.record(str(r), tests, select.ruff_graph(str(r), ["."]), timeout=120)
+    inputs.write_map(doc, str(r / "mira-vitals-inputs.json"))
+    _git(top, "init", "-q", "-b", "main")
+    _git(top, "add", ".")
+    _git(top, "commit", "-qm", "base")
+    return top, r
+
+
+@needs_tools
+def test_a_sub_directory_project_selects_by_its_own_relative_paths(subdir_repo):
+    top, r = subdir_repo
+    base = _rev(top)
+    (r / "rules/a.yaml").write_text("a: 2\n")
+    _git(top, "commit", "-qam", "rule")
+    doc = select.main_select(_ns(r, base, _rev(top)), {}, TABLE)
+    assert doc["triggers"] == [] and doc["run_files"] == ["tests/test_rules.py"]
+
+
+@needs_tools
+def test_a_sub_directory_project_still_sees_its_map_change(subdir_repo):
+    top, r = subdir_repo
+    base = _rev(top)
+    m = json.loads((r / "mira-vitals-inputs.json").read_text())
+    m["tests"]["tests/test_rules.py"]["inputs"] = ["nothing/*"]
+    (r / "mira-vitals-inputs.json").write_text(json.dumps(m))
+    _git(top, "commit", "-qam", "map")
+    doc = select.main_select(_ns(r, base, _rev(top)), {}, TABLE)
+    assert "data-map" in doc["triggers"] and doc["mode"] == "full"
+
+
+@needs_tools
+def test_a_change_outside_the_sub_directory_is_a_full_run(subdir_repo):
+    top, r = subdir_repo
+    base = _rev(top)
+    (top / "other/x.txt").write_text("y\n")
+    _git(top, "commit", "-qam", "outside")
+    doc = select.main_select(_ns(r, base, _rev(top)), {}, TABLE)
+    assert doc["triggers"] == ["outside-root"] and doc["mode"] == "full"

@@ -240,7 +240,13 @@ def _git(args: list[str], cwd: str) -> str:
 
 
 def changed(repo: str, base: str, head: str) -> list[Change]:
-    out = _git(["diff", "--name-status", "-M", "-z", f"{base}...{head}"], repo)
+    """Changes between the revisions, with paths relative to ``repo`` (the
+    paths ls-files, the graph, the map and the recorder use). When ``repo``
+    is a sub-directory of the checkout, a change outside it is status
+    ``outside`` (a full run: nothing inside says what it feeds)."""
+    prefix = _git(["rev-parse", "--show-prefix"], repo).strip()
+    relative = ["--relative"] if prefix else []
+    out = _git(["diff", "--name-status", "-M", "-z", *relative, f"{base}...{head}"], repo)
     parts = out.split("\0")
     changes, i = [], 0
     while i < len(parts) - 1:
@@ -255,6 +261,10 @@ def changed(repo: str, base: str, head: str) -> list[Change]:
             status = {"A": "added", "M": "modified", "D": "deleted"}.get(code[0], "other")
             changes.append(Change(status, parts[i + 1]))
             i += 2
+    if prefix:
+        # Both sides of every rename, toplevel-relative.
+        everything = _git(["diff", "--name-only", "--no-renames", "-z", f"{base}...{head}"], repo)
+        changes += [Change("outside", p) for p in everything.split("\0") if p and not p.startswith(prefix)]
     return changes
 
 
@@ -382,6 +392,14 @@ def tracked_files(repo: str) -> list[str]:
     return [p for p in _git(["ls-files", "-z"], repo).split("\0") if p]
 
 
+def _was_seen(path: str, seen: tuple[set[str], set[str]]) -> bool:
+    """Whether a recording saw the path read, or saw it in a listed directory
+    (or listed it: a submodule's gitlink is a directory)."""
+    reads, lists = seen
+    parent = path.rsplit("/", 1)[0] if "/" in path else "."
+    return path in reads or parent in lists or path in lists
+
+
 def decide(
     settings: Settings,
     changes: list[Change],
@@ -389,6 +407,7 @@ def decide(
     graph: dict[str, list[str]] | None,
     lomitus_files: set[str] | None,
     data_map: dict[str, list[str]] | None = None,
+    seen: tuple[set[str], set[str]] | None = None,
 ) -> dict[str, Any]:
     """The selection itself, pure: which full-run triggers fire and which test
     files a change reaches. ``graph`` is ruff's dependency map (or None when
@@ -396,12 +415,18 @@ def decide(
     affected-files set (or None). ``data_map`` (test file -> input globs, only
     the entries still current) replaces the ``non-py`` trigger: a changed data
     file selects the tests whose globs match it and every test file without a
-    current entry."""
+    current entry. ``seen`` (every path the recording saw read, every
+    directory it saw listed) is the fail-safe: a new data file, or one no
+    recording saw read or listed, is a full run (``data-added`` /
+    ``data-unseen``)."""
     triggers: set[str] = set()
     tests = set(test_files)
     present_py: list[str] = []
     data_paths: list[str] = []
     for c in changes:
+        if c.status == "outside":
+            triggers.add("outside-root")
+            continue
         paths = [c.path] + ([c.old_path] if c.old_path else [])
         for name, globs in settings.trigger_globs.items():
             if globs and any(matches(p, globs) for p in paths):
@@ -418,8 +443,12 @@ def decide(
             if not p.endswith(".py") and not matches(p, settings.ignore_globs):
                 if data_map is None:
                     triggers.add("non-py")
-                else:
-                    data_paths.append(p)
+                    continue
+                data_paths.append(p)
+                if c.status == "added" or (c.status == "renamed" and p == c.path):
+                    triggers.add("data-added")
+                elif seen is None or not _was_seen(p, seen):
+                    triggers.add("data-unseen")
         if is_py and c.status != "deleted":
             present_py.append(c.path)
         if data_map is not None:
@@ -546,11 +575,13 @@ def run(
             lomitus_files, lomitus_version = lomitus_affected(repo, base, head)
             doc["graph"]["lomitus_version"] = lomitus_version
         data_map = None
+        seen = None
         if settings.data_map:
             from . import inputs
 
             entries = inputs.load_map(os.path.join(repo, settings.data_map))
             data_map, stale = inputs.current_entries(repo, entries, graph)
+            seen = inputs.seen_paths(entries)
             doc["data_map"] = {
                 "path": settings.data_map,
                 "entries": len(entries),
@@ -558,7 +589,7 @@ def run(
                 "stale": len(stale),
                 "universal": sum(1 for g in data_map.values() if "**" in g),
             }
-        result = decide(settings, changes, test_files, graph, lomitus_files, data_map)
+        result = decide(settings, changes, test_files, graph, lomitus_files, data_map, seen)
         if settings.data_map and any(settings.data_map in (c.path, c.old_path) for c in changes):
             result["triggers"] = sorted(set(result["triggers"]) | {"data-map"})
         if "data_map" in doc:

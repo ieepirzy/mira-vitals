@@ -159,28 +159,58 @@ audit hook; standard library only). Per file:
 
 | What it did | Input glob |
 |---|---|
-| opened `a/b/c.yaml` | `a/b/*` (siblings too: a probe for a file that is not there yet stays covered) |
+| opened `a/b/c.yaml` (also `sqlite3.connect`, `pkgutil.get_data`) | `a/b/*` (siblings too) |
 | listed `a/b` (`os.walk`, `Path.glob`, `glob.glob`, `scandir`) | `a/b/**` |
-| started any process, had a test skip, fail or error, or listed the repository root | `**` (runs on every data change) |
+| started any process; had a test skip, fail, error or get deselected (`-k`, `-m`, `--deselect`, `addopts`); listed the repository root; read through a symbolic link that leaves the repository | `**` (runs on every data change) |
 
-Reads made by pytest itself (collection, configuration) and by the import
-system (finding and loading modules) are not the test's and are not recorded;
-a test that reads Python source as data (hashing it, say) is, and a change to
-that source selects it even when no import edge leads there.
+A read through a symbolic link inside the repository is recorded under both
+the link and its target. Reads made by pytest itself (collection,
+configuration) and module loading by the import system are not the test's and
+are not recorded. A test that reads Python source as data (hashing it, say)
+is recorded, and a change to that source selects it even when no import edge
+leads there. The recorder's guard against recursion is per thread, so reads
+from worker threads are seen.
 
-With `select.data_map` set, a changed data file selects the test files whose
-globs match it, every test file the map does not list, and every test file
-whose *code digest* (the test file and its first-party import closure, from
-ruff's graph) differs from the recording: its code changed, so its reads may
-have. A changed Python file consults the map too: besides the import graph's
-selection, it selects the tests recorded reading it, the universal ones and
-the unlisted or stale ones. Re-record to narrow those again. Changing the map itself is a full run
-(trigger `data-map`); a map that cannot be read is `selector_error`. All other
-full-run triggers are unchanged. `selection.json` reports the map under
-`data_map` (entries, current, stale, universal, selected_by_data).
+With `select.data_map` set, a changed data file selects:
+- the test files whose globs match it;
+- every test file the map does not list;
+- every test file whose *code digest* (the test file and its first-party
+  import closure, from ruff's graph) differs from the recording, because
+  changed code may read different files.
 
-Commit the map and re-record when tests change how they find their data; a
-stale entry only costs selection, never coverage.
+A changed Python file consults the map too. Besides the import graph's
+selection, it selects the tests recorded reading it, the universal ones, and
+the unlisted or stale ones.
+
+**Fail-safe.** The map also keeps every path the recording saw read and
+every directory it saw listed. A changed data file is a full run when:
+- it is new: added, or the new side of a rename (trigger `data-added`); or
+- no recording saw it read, nor saw it in a listed directory
+  (`data-unseen`).
+
+Files matching `ignore_globs` (the files that never feed a test) are exempt.
+Edits to files a test was recorded reading stay selective. Other full runs:
+- a change to the map itself (`data-map`);
+- an unreadable map (`selector_error`);
+- when `--repo` is a sub-directory of the checkout, any change outside it
+  (`outside-root`).
+
+All other full-run triggers are unchanged. `selection.json` reports the map
+under `data_map` (entries, current, stale, universal, selected_by_data).
+
+**What the map cannot see.** Some reads raise no audit event:
+- `os.stat`, `os.path.exists`, `os.access`;
+- files opened from C code (extension modules).
+
+A new or never-read file is covered by the fail-safe. The blind spot that
+remains: an existing file that some test was recorded reading, which another
+test reads only through a stat probe or C code. A change to it selects only
+the recorded reader. Advisory mode and `ci report`'s escape count are the net
+for that. Turn on `enforce` only after weeks of zero escapes.
+
+Commit the map and re-record when tests change how they find their data. A
+stale entry runs on every data change until then, which costs selection. It
+does not restore reads the recording never saw.
 
 ## Configuration
 

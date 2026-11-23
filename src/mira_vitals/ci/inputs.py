@@ -20,6 +20,14 @@ session fixture hides a read behind another file's run) with
   change. Python source a test reads as data (hashing it, say) is recorded
   like any file; reads made by the import system are not, the graph owns them.
 
+**Fail-safe.** Each entry also keeps the raw paths it read and listed. A
+changed data file that is new (added, or a rename's new side), or that no
+test was ever seen to read or to find in a listed directory, forces a full
+run unless it matches ``ignore_globs``: no recording vouches for who reads
+it. What remains unseen: an existing file one test was recorded reading
+that another test reads only through a ``stat`` probe or from C code (a
+change to it selects the recorded reader only).
+
 **Staleness.** Each entry pins the test file's *code digest*: the contents of
 the test file and its first-party forward import closure (ruff's graph). When
 the selector sees a different digest, that test's code changed since the
@@ -42,7 +50,7 @@ import sys
 import tempfile
 from typing import Any
 
-MAP_VERSION = 1
+MAP_VERSION = 2
 UNIVERSAL = "**"
 PLUGIN_MODULE = "mira_vitals_inputs_plugin"
 
@@ -187,9 +195,14 @@ def record(
     tests: dict[str, Any] = {}
     for rel in sorted(records):
         globs, why = to_globs(records[rel])
+        rec = records[rel]
         entry: dict[str, Any] = {
             "inputs": globs,
             "code_digest": code_digest(repo, graph, rel),
+            "reads": sorted(
+                p for p in rec.get("reads") or [] if not p.endswith(".pyc")
+            ),
+            "lists": sorted(rec.get("lists") or []),
         }
         if why:
             entry["universal_because"] = why
@@ -219,6 +232,10 @@ def load_map(path: str) -> dict[str, dict[str, Any]]:
             isinstance(g, str) and g for g in inputs
         ):
             raise ValueError(f"data map {path}: {rel} needs a list of input globs")
+        for key in ("reads", "lists"):
+            seen = entry.get(key)
+            if not isinstance(seen, list) or not all(isinstance(p, str) for p in seen):
+                raise ValueError(f"data map {path}: {rel} needs a list of {key}")
         if not isinstance(entry.get("code_digest"), str):
             raise ValueError(f"data map {path}: {rel} has no code_digest")  # noqa: TRY004 - config errors are ValueError
     return tests
@@ -238,6 +255,18 @@ def current_entries(
         else:
             stale.append(rel)
     return current, sorted(stale)
+
+
+def seen_paths(tests: dict[str, dict[str, Any]]) -> tuple[set[str], set[str]]:
+    """Every path any test was recorded reading, and every directory any test
+    was recorded listing (stale entries too: they are facts about the tree as
+    recorded)."""
+    reads: set[str] = set()
+    lists: set[str] = set()
+    for entry in tests.values():
+        reads.update(entry["reads"])
+        lists.update(entry["lists"])
+    return reads, lists
 
 
 def write_map(doc: dict[str, Any], output: str) -> None:
