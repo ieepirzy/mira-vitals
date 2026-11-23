@@ -10,7 +10,8 @@ Test-impact selection with the safety nets agreed for it:
 * **Full-run triggers.** Changes no import graph can see force a full run:
   any ``conftest.py``, migrations, dependency and container files, CI
   configuration, any non-Python file (data, fixtures and templates feed tests
-  without an import), deleted or renamed modules, anything in the import
+  without an import) unless a *data map* says which tests read it, deleted or
+  renamed modules, anything in the import
   closure of a ``conftest.py``, and a changed module the graph doesn't know.
 * **Fail open.** Any error -- a missing graph tool, a bad revision, an
   unreadable config -- is a full run, recorded as trigger ``selector_error``.
@@ -33,6 +34,14 @@ gate skips its tests with ``-k "not <keyword>"`` (enforce, pull requests
 only) even when the rest of the run is full. Its policy can differ from the
 file selection's (``[select.gates.<name>] policy``).
 
+**Data map** (``select.data_map``, recorded by ``mira-vitals ci inputs``):
+for each test file, the globs of the data it was measured to read. With a
+map, a changed non-Python file selects the test files whose globs match it,
+plus every test file the map does not cover or whose code changed since the
+recording (its *code digest* no longer matches), instead of forcing a full
+run. A change to the map itself is a full run (trigger ``data-map``); a map
+that cannot be read is a ``selector_error``.
+
 Result caching is not done here. With ``record_closure_hashes`` the selector
 records each test file's Lomitus ``closure_hash`` (code only) with the
 environment folded into ``extra`` -- Python version, lockfile digest, named
@@ -52,6 +61,7 @@ import subprocess
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 SELECTOR_NAME = "mira-vitals-select"
@@ -86,8 +96,10 @@ DEFAULT_LOCKFILES = ["uv.lock", "poetry.lock", "requirements.txt", "requirements
 #: shell or argument injection in the calling workflow.
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*\.py$")
 MAX_LISTED_FILES = 5000
+_SAFE_DATA_MAP = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*\.json$")
 
 
+@lru_cache(maxsize=4096)
 def _glob_regex(pattern: str) -> re.Pattern[str]:
     out, i = "", 0
     while i < len(pattern):
@@ -148,6 +160,8 @@ class Settings:
     service_images: list[str] = field(default_factory=list)
     lockfiles: list[str] = field(default_factory=lambda: list(DEFAULT_LOCKFILES))
     gates: dict[str, Gate] = field(default_factory=dict)
+    #: Repo-relative path of the data map (``mira-vitals ci inputs``), if any.
+    data_map: str | None = None
 
     @classmethod
     def from_table(cls, table: dict[str, Any] | None) -> Settings:
@@ -179,6 +193,11 @@ class Settings:
         unknown = set(s.graph_sources) - {"ruff", "lomitus"}
         if unknown or not s.graph_sources:
             raise ValueError(f"select.graph_sources must name ruff and/or lomitus, not {sorted(unknown)}")
+        if "data_map" in table:
+            path = table["data_map"]
+            if not isinstance(path, str) or not _SAFE_DATA_MAP.match(path) or ".." in path.split("/"):
+                raise ValueError("select.data_map must be a plain repo-relative .json path")
+            s.data_map = path
         if "record_closure_hashes" in table:
             s.record_closure_hashes = bool(table["record_closure_hashes"])
         gates = table.get("gates")
@@ -369,14 +388,19 @@ def decide(
     test_files: list[str],
     graph: dict[str, list[str]] | None,
     lomitus_files: set[str] | None,
+    data_map: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """The selection itself, pure: which full-run triggers fire and which test
     files a change reaches. ``graph`` is ruff's dependency map (or None when
     ruff isn't a configured source); ``lomitus_files`` is Lomitus's
-    affected-files set (or None)."""
+    affected-files set (or None). ``data_map`` (test file -> input globs, only
+    the entries still current) replaces the ``non-py`` trigger: a changed data
+    file selects the tests whose globs match it and every test file without a
+    current entry."""
     triggers: set[str] = set()
     tests = set(test_files)
     present_py: list[str] = []
+    data_paths: list[str] = []
     for c in changes:
         paths = [c.path] + ([c.old_path] if c.old_path else [])
         for name, globs in settings.trigger_globs.items():
@@ -392,9 +416,16 @@ def decide(
             triggers.add("deleted-py")
         for p in paths:
             if not p.endswith(".py") and not matches(p, settings.ignore_globs):
-                triggers.add("non-py")
+                if data_map is None:
+                    triggers.add("non-py")
+                else:
+                    data_paths.append(p)
         if is_py and c.status != "deleted":
             present_py.append(c.path)
+        if data_map is not None:
+            # Python read as data (a test hashing sources) is in the map too:
+            # the import graph cannot see such a read.
+            data_paths.extend(p for p in paths if p.endswith(".py"))
 
     reached: set[str] = set()
     if graph is not None:
@@ -408,12 +439,30 @@ def decide(
         reached |= reverse_closure(graph, present_py)
     if lomitus_files is not None:
         reached |= lomitus_files
+    data_selected: set[str] = set()
+    if data_paths and data_map is not None:
+        # A path is also tried as a directory (a submodule's gitlink). Test
+        # files without a current entry (unlisted, or code changed since the
+        # recording) run on any change the map is asked about, Python too:
+        # nothing says what they read now.
+        data_selected = {t for t in tests if t not in data_map}
+        data_selected |= {
+            t for t, globs in data_map.items()
+            if t in tests and any(matches(p, globs) or matches(p + "/-", globs) for p in data_paths)
+        }
     selected = {f for f in reached if f in tests}
+    selected |= data_selected
     selected |= {p for p in present_py if p in tests}
     selected |= {f for f in tests if matches(f, settings.always_run)}
     if any(not _SAFE_PATH.match(f) for f in selected):
         triggers.add("unsafe-path")
-    return {"triggers": sorted(triggers), "selected": sorted(selected), "tests": sorted(tests), "reached": reached}
+    return {
+        "triggers": sorted(triggers),
+        "selected": sorted(selected),
+        "tests": sorted(tests),
+        "reached": reached,
+        "data_selected": sorted(data_selected),
+    }
 
 
 def _sha256_file(path: str) -> str | None:
@@ -496,7 +545,24 @@ def run(
         if "lomitus" in settings.graph_sources:
             lomitus_files, lomitus_version = lomitus_affected(repo, base, head)
             doc["graph"]["lomitus_version"] = lomitus_version
-        result = decide(settings, changes, test_files, graph, lomitus_files)
+        data_map = None
+        if settings.data_map:
+            from . import inputs
+
+            entries = inputs.load_map(os.path.join(repo, settings.data_map))
+            data_map, stale = inputs.current_entries(repo, entries, graph)
+            doc["data_map"] = {
+                "path": settings.data_map,
+                "entries": len(entries),
+                "current": len(data_map),
+                "stale": len(stale),
+                "universal": sum(1 for g in data_map.values() if "**" in g),
+            }
+        result = decide(settings, changes, test_files, graph, lomitus_files, data_map)
+        if settings.data_map and any(settings.data_map in (c.path, c.old_path) for c in changes):
+            result["triggers"] = sorted(set(result["triggers"]) | {"data-map"})
+        if "data_map" in doc:
+            doc["data_map"]["selected_by_data"] = len(result["data_selected"])
         conftests = [f for f in all_files if f.rsplit("/", 1)[-1] == "conftest.py"]
         gated = {name: gated_test_files(repo, test_files, g.keyword, conftests) for name, g in settings.gates.items()}
         gates = decide_gates(settings, changes, result["triggers"], result["reached"], gated)

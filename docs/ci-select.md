@@ -141,6 +141,47 @@ test's result depends on more than its code.
 **Nothing is skipped on these hashes.** They exist so a result cache can be
 evaluated against real runs first.
 
+## Data map: select by the data a test was seen to read
+
+Without a map, any changed file that is not Python (and not in
+`ignore_globs`) is a full run: tests read YAML, fixtures and templates with no
+import edge to follow. In a repository that is mostly data, that is nearly
+every change. A data map replaces the `non-py` trigger with a measurement.
+
+Record it with the project's own Python:
+
+```sh
+mira-vitals ci inputs --python .venv/bin/python --jobs 2   # writes select.data_map
+```
+
+Each test file runs in its own pytest process with a recording plugin (an
+audit hook; standard library only). Per file:
+
+| What it did | Input glob |
+|---|---|
+| opened `a/b/c.yaml` | `a/b/*` (siblings too: a probe for a file that is not there yet stays covered) |
+| listed `a/b` (`os.walk`, `Path.glob`, `glob.glob`, `scandir`) | `a/b/**` |
+| started any process, had a test skip, fail or error, or listed the repository root | `**` (runs on every data change) |
+
+Reads made by pytest itself (collection, configuration) and by the import
+system (finding and loading modules) are not the test's and are not recorded;
+a test that reads Python source as data (hashing it, say) is, and a change to
+that source selects it even when no import edge leads there.
+
+With `select.data_map` set, a changed data file selects the test files whose
+globs match it, every test file the map does not list, and every test file
+whose *code digest* (the test file and its first-party import closure, from
+ruff's graph) differs from the recording: its code changed, so its reads may
+have. A changed Python file consults the map too: besides the import graph's
+selection, it selects the tests recorded reading it, the universal ones and
+the unlisted or stale ones. Re-record to narrow those again. Changing the map itself is a full run
+(trigger `data-map`); a map that cannot be read is `selector_error`. All other
+full-run triggers are unchanged. `selection.json` reports the map under
+`data_map` (entries, current, stale, universal, selected_by_data).
+
+Commit the map and re-record when tests change how they find their data; a
+stale entry only costs selection, never coverage.
+
 ## Configuration
 
 In `mira-vitals.toml` (or `[tool.mira_vitals.select]` in `pyproject.toml`):
@@ -156,6 +197,7 @@ ignore_globs = ["**/*.md"]
 record_closure_hashes = false
 cache_env = []
 service_images = []
+data_map = "mira-vitals-inputs.json" # optional: `mira-vitals ci inputs` writes it
 
 [select.triggers]                   # extend or narrow the defaults
 fixtures = ["tests/data/**"]
