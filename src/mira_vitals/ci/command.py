@@ -86,6 +86,17 @@ def _parser() -> argparse.ArgumentParser:
     sel.add_argument("--output", help="selection.json path (default: the state dir).")
     sel.add_argument("--args-out", help="Test files to run, one per line; empty means the whole suite.")
     sel.add_argument("--budget", type=float, default=DEFAULT_SELECT_BUDGET_SECONDS)
+    inp = sub.add_parser(
+        "inputs", help="Record which data files each test file reads (writes the data map select.data_map names)."
+    )
+    inp.add_argument("--repo", default=".", help="Project root inside the checkout.")
+    inp.add_argument("--output", help="Map path (default: select.data_map, else mira-vitals-inputs.json).")
+    inp.add_argument("--python", help="The project's Python, whose pytest runs the tests (default: this one).")
+    inp.add_argument("--jobs", type=int, default=2, help="Test files recorded at once.")
+    inp.add_argument("--timeout", type=float, default=900.0, help="Seconds per test file.")
+    inp.add_argument("--only", action="append", default=[], help="Record just these test files (repeatable).")
+    inp.add_argument("--budget", type=float, default=4 * 3600.0)
+    inp.add_argument("pytest_args", nargs="*", help="Extra pytest arguments, after --.")
     return parser
 
 
@@ -129,6 +140,37 @@ def _select(args: argparse.Namespace, env: dict[str, str]) -> None:
         print(f"  gate {gate['name']} [{gate['keyword']}, {gate['policy']}]: {state}{skipping}")
     for err in doc.get("errors") or []:
         _warn(f"select: {err}")
+
+
+def _inputs(args: argparse.Namespace) -> None:
+    """Record the data map. A test file whose recording cannot be trusted maps
+    to everything, so a partial failure only costs selection, never safety."""
+    import subprocess
+
+    from . import inputs
+    from . import select as selector
+
+    settings = selector.Settings.from_table(_select_table(args.repo))
+    repo = args.repo
+    test_files = [f for f in selector.tracked_files(repo) if f.endswith(".py") and selector.matches(f, settings.test_globs)]
+    if args.only:
+        test_files = [f for f in test_files if f in set(args.only)]
+    graph = selector.ruff_graph(repo, settings.ruff_paths)
+    head = (
+        subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=False).stdout.strip()
+        or None
+    )
+    doc = inputs.record(
+        repo, test_files, graph, python=args.python, extra_args=args.pytest_args, jobs=args.jobs,
+        timeout=args.timeout, commit=head,
+    )
+    output = args.output or os.path.join(repo, settings.data_map or "mira-vitals-inputs.json")
+    inputs.write_map(doc, output)
+    universal = sum(1 for e in doc["tests"].values() if inputs.UNIVERSAL in e["inputs"])
+    print(f"mira-vitals ci inputs: {len(doc['tests'])} test files recorded, {universal} read everything -> {output}")
+    for rel, entry in doc["tests"].items():
+        if entry.get("universal_because"):
+            print(f"  {rel}: {entry['universal_because']}")
 
 
 def _baseline_path(env: dict[str, str]) -> str:
@@ -513,6 +555,8 @@ def main(argv: list[str] | None = None, env: dict[str, str] | None = None) -> in
             _report(args, env)
         elif args.command == "select":
             _select(args, env)
+        elif args.command == "inputs":
+            _inputs(args)
         else:
             _warn("usage: mira-vitals ci start | mark <name> | report | select")
     except _OutOfTime:

@@ -141,6 +141,77 @@ test's result depends on more than its code.
 **Nothing is skipped on these hashes.** They exist so a result cache can be
 evaluated against real runs first.
 
+## Data map: select by the data a test was seen to read
+
+Without a map, any changed file that is not Python (and not in
+`ignore_globs`) is a full run: tests read YAML, fixtures and templates with no
+import edge to follow. In a repository that is mostly data, that is nearly
+every change. A data map replaces the `non-py` trigger with a measurement.
+
+Record it with the project's own Python:
+
+```sh
+mira-vitals ci inputs --python .venv/bin/python --jobs 2   # writes select.data_map
+```
+
+Each test file runs in its own pytest process with a recording plugin (an
+audit hook; standard library only). Per file:
+
+| What it did | Input glob |
+|---|---|
+| opened `a/b/c.yaml` (also `sqlite3.connect`, `pkgutil.get_data`) | `a/b/*` (siblings too) |
+| listed `a/b` (`os.walk`, `Path.glob`, `glob.glob`, `scandir`) | `a/b/**` |
+| started any process; had a test skip, fail, error or get deselected (`-k`, `-m`, `--deselect`, `addopts`); listed the repository root; read through a symbolic link that leaves the repository | `**` (runs on every data change) |
+
+A read through a symbolic link inside the repository is recorded under both
+the link and its target. Reads made by pytest itself (collection,
+configuration) and module loading by the import system are not the test's and
+are not recorded. A test that reads Python source as data (hashing it, say)
+is recorded, and a change to that source selects it even when no import edge
+leads there. The recorder's guard against recursion is per thread, so reads
+from worker threads are seen.
+
+With `select.data_map` set, a changed data file selects:
+- the test files whose globs match it;
+- every test file the map does not list;
+- every test file whose *code digest* (the test file and its first-party
+  import closure, from ruff's graph) differs from the recording, because
+  changed code may read different files.
+
+A changed Python file consults the map too. Besides the import graph's
+selection, it selects the tests recorded reading it, the universal ones, and
+the unlisted or stale ones.
+
+**Fail-safe.** The map also keeps every path the recording saw read and
+every directory it saw listed. A changed data file is a full run when:
+- it is new: added, or the new side of a rename (trigger `data-added`); or
+- no recording saw it read, nor saw it in a listed directory
+  (`data-unseen`).
+
+Files matching `ignore_globs` (the files that never feed a test) are exempt.
+Edits to files a test was recorded reading stay selective. Other full runs:
+- a change to the map itself (`data-map`);
+- an unreadable map (`selector_error`);
+- when `--repo` is a sub-directory of the checkout, any change outside it
+  (`outside-root`).
+
+All other full-run triggers are unchanged. `selection.json` reports the map
+under `data_map` (entries, current, stale, universal, selected_by_data).
+
+**What the map cannot see.** Some reads raise no audit event:
+- `os.stat`, `os.path.exists`, `os.access`;
+- files opened from C code (extension modules).
+
+A new or never-read file is covered by the fail-safe. The blind spot that
+remains: an existing file that some test was recorded reading, which another
+test reads only through a stat probe or C code. A change to it selects only
+the recorded reader. Advisory mode and `ci report`'s escape count are the net
+for that. Turn on `enforce` only after weeks of zero escapes.
+
+Commit the map and re-record when tests change how they find their data. A
+stale entry runs on every data change until then, which costs selection. It
+does not restore reads the recording never saw.
+
 ## Configuration
 
 In `mira-vitals.toml` (or `[tool.mira_vitals.select]` in `pyproject.toml`):
@@ -156,6 +227,7 @@ ignore_globs = ["**/*.md"]
 record_closure_hashes = false
 cache_env = []
 service_images = []
+data_map = "mira-vitals-inputs.json" # optional: `mira-vitals ci inputs` writes it
 
 [select.triggers]                   # extend or narrow the defaults
 fixtures = ["tests/data/**"]
